@@ -23,6 +23,52 @@ const getProvidersByZipcode = (zipcode) => {
   ).sort((a, b) => a.priority - b.priority);
 };
 
+// Week-based date generation helper functions
+const getWeekDates = (weeks = 4) => {
+  const today = new Date();
+  const weekDates = [];
+
+  const todayUTC = new Date(Date.UTC(
+    today.getUTCFullYear(),
+    today.getUTCMonth(),
+    today.getUTCDate()
+  ));
+
+  const currentWeekStart = new Date(todayUTC);
+  currentWeekStart.setUTCDate(todayUTC.getUTCDate() - todayUTC.getUTCDay());
+
+  for (let week = 0; week < weeks; week++) {
+    const weekStartDate = new Date(currentWeekStart);
+    weekStartDate.setUTCDate(currentWeekStart.getUTCDate() + (week * 7));
+
+    weekDates.push({
+      week: week + 1,
+      weekName: week === 0 ? 'Current Week' : `Week ${week + 1}`,
+      date: weekStartDate.toISOString().split('T')[0],
+      isCurrentWeek: week === 0
+    });
+  }
+
+  return weekDates;
+};
+
+const generateWeekBasedDates = (weeks = 4) => {
+  const weekDates = getWeekDates(weeks);
+  return weekDates.map(week => week.date);
+};
+
+const getWeekStartDate = (dateStr) => {
+  const date = new Date(`${dateStr}T00:00:00Z`);
+  if (Number.isNaN(date.getTime())) {
+    return dateStr;
+  }
+
+  const weekStart = new Date(date);
+  weekStart.setUTCDate(date.getUTCDate() - date.getUTCDay());
+
+  return weekStart.toISOString().split('T')[0];
+};
+
 const getAllProviders = () => {
   return providers.filter(provider => provider.status === 'active')
     .sort((a, b) => a.priority - b.priority);
@@ -39,14 +85,48 @@ const getProviderById = (providerId) => {
 const cache = new Map();
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes cache
 
-// Rate limiting and retry logic
+// Concurrency helpers
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+const createSemaphore = (maxConcurrency = 8) => {
+  let activeCount = 0;
+  const queue = [];
+
+  const runNext = () => {
+    if (activeCount >= maxConcurrency) {
+      return;
+    }
+    const nextTask = queue.shift();
+    if (!nextTask) {
+      return;
+    }
+    activeCount++;
+    nextTask()
+      .finally(() => {
+        activeCount--;
+        runNext();
+      });
+  };
+
+  const run = (task) => {
+    return new Promise((resolve, reject) => {
+      const execute = () => Promise.resolve().then(task).then(resolve).catch(reject);
+      queue.push(execute);
+      runNext();
+    });
+  };
+
+  return { run };
+};
+
+const requestSemaphore = createSemaphore(8);
+
 const rateLimitTracker = {
-  calls: 0,
-  windowStart: Date.now(),
-  maxCallsPerMinute: 50, // Conservative limit (Zenoti allows 60)
   retryDelays: [1000, 2000, 5000, 10000], // Progressive backoff
   maxRetries: 4
 };
+
+// Rate limiting and retry logic
 
 const getCachedData = (key) => {
   const cached = cache.get(key);
@@ -64,37 +144,10 @@ const setCachedData = (key, data) => {
 };
 
 // Rate limiting helper
-const checkRateLimit = () => {
-  const now = Date.now();
-  const timeSinceWindowStart = now - rateLimitTracker.windowStart;
-  
-  // Reset window if more than 60 seconds have passed
-  if (timeSinceWindowStart >= 60000) {
-    rateLimitTracker.calls = 0;
-    rateLimitTracker.windowStart = now;
-  }
-  
-  // Check if we're approaching the limit
-  if (rateLimitTracker.calls >= rateLimitTracker.maxCallsPerMinute) {
-    const waitTime = 60000 - timeSinceWindowStart;
-    console.log(`Rate limit reached. Waiting ${waitTime}ms before next request...`);
-    return waitTime;
-  }
-  
-  rateLimitTracker.calls++;
-  return 0;
-};
-
 // Retry logic with exponential backoff
 const makeZenotiRequest = async (requestFn, retryCount = 0) => {
   try {
-    // Check rate limit before making request
-    const waitTime = checkRateLimit();
-    if (waitTime > 0) {
-      await new Promise(resolve => setTimeout(resolve, waitTime));
-    }
-    
-    const response = await requestFn();
+    const response = await requestSemaphore.run(() => requestFn());
     return response;
   } catch (error) {
     // Handle rate limit errors (429)
@@ -107,7 +160,9 @@ const makeZenotiRequest = async (requestFn, retryCount = 0) => {
         const retryAfter = error.response.headers['retry-after'];
         const actualDelay = retryAfter ? parseInt(retryAfter) * 1000 : delay;
         
-        await new Promise(resolve => setTimeout(resolve, actualDelay));
+        if (actualDelay > 0) {
+          await sleep(actualDelay);
+        }
         return makeZenotiRequest(requestFn, retryCount + 1);
       } else {
         console.error(`Max retries (${rateLimitTracker.maxRetries}) exceeded for rate limited request`);
@@ -187,13 +242,13 @@ const aggregateCategoriesWithServicesFromAllCenters = async (centerIds) => {
   const centerPromises = centerIds.map(async (centerId) => {
     try {
       const categoriesData = await fetchZenotiCategories(centerId);
-  return {
+      return {
         centerId,
         categories: categoriesData.categories || []
       };
     } catch (error) {
       console.error(`Failed to fetch categories for center ${centerId}:`, error.message);
-  return {
+      return {
         centerId,
         categories: []
       };
@@ -620,7 +675,7 @@ const createZenotiBooking = async (centerId, date, serviceIds) => {
 };
 
 // Get available slots for a booking
-const fetchZenotiSlots = async (bookingId) => {
+const fetchZenotiSlots = async (bookingId, checkFutureDayAvailability = false) => {
   const zenotiApiKey = process.env.ZENOTI_API_KEY;
   const zenotiBaseUrl = process.env.ZENOTI_BASE_URL || 'https://api.zenoti.com/v1';
   
@@ -628,16 +683,22 @@ const fetchZenotiSlots = async (bookingId) => {
     throw new Error('Zenoti API key not configured');
   }
 
-  const cacheKey = `slots-${bookingId}`;
+  const cacheKey = `slots-${bookingId}-${checkFutureDayAvailability ? 'future' : 'current'}`;
   const cachedData = getCachedData(cacheKey);
   if (cachedData) {
-    console.log(`Cache hit for slots: ${bookingId}`);
+    console.log(`Cache hit for slots: ${bookingId} (future: ${checkFutureDayAvailability})`);
     return cachedData;
   }
 
   try {
+    // Build URL with optional future day availability parameter
+    let url = `${zenotiBaseUrl}/bookings/${bookingId}/slots`;
+    if (checkFutureDayAvailability) {
+      url += '?check_future_day_availability=true';
+    }
+
     const response = await makeZenotiRequest(async () => {
-      return await axios.get(`${zenotiBaseUrl}/bookings/${bookingId}/slots`, {
+      return await axios.get(url, {
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `apikey ${zenotiApiKey}`
@@ -646,7 +707,7 @@ const fetchZenotiSlots = async (bookingId) => {
     });
     
     setCachedData(cacheKey, response.data, 300000); // 5 minutes cache
-    console.log(`Cached slots data for booking: ${bookingId}`);
+    console.log(`Cached slots data for booking: ${bookingId} (future: ${checkFutureDayAvailability})`);
     return response.data;
   } catch (error) {
     console.error(`Zenoti API error for slots (booking ${bookingId}): ${error.message}`);
@@ -661,12 +722,33 @@ const aggregateSlotsIntoHourlyBuckets = (slots) => {
   slots.forEach(slot => {
     if (!slot.Available) return; // Skip unavailable slots
     
-    // Extract time from slot (assuming format like "09:00:00" or "09:00")
+    // Extract time from slot (handles both "09:00:00" and "2025-10-05T09:00:00" formats)
     const timeStr = slot.Time || slot.time || slot.start_time || '';
     if (!timeStr) return;
     
-    // Parse time and round down to nearest hour
-    const [hours] = timeStr.split(':').map(Number);
+    let hours;
+    
+    // Check if it's a full ISO datetime string
+    if (timeStr.includes('T')) {
+      // Extract time part from ISO datetime (e.g., "2025-10-05T12:00:00" -> "12:00:00")
+      const timePart = timeStr.split('T')[1];
+      if (timePart) {
+        hours = parseInt(timePart.split(':')[0], 10);
+      } else {
+        return; // Invalid format
+      }
+    } else {
+      // Handle time-only format (e.g., "12:00:00" or "12:00")
+      const timeParts = timeStr.split(':');
+      hours = parseInt(timeParts[0], 10);
+    }
+    
+    // Validate hours (0-23)
+    if (isNaN(hours) || hours < 0 || hours > 23) {
+      console.warn(`Invalid hour value: ${hours} from time string: ${timeStr}`);
+      return;
+    }
+    
     const hourKey = `${hours.toString().padStart(2, '0')}:00`;
     
     // Initialize bucket if it doesn't exist
@@ -688,6 +770,44 @@ const aggregateSlotsIntoHourlyBuckets = (slots) => {
   // Convert Map to sorted array
   return Array.from(hourlyBuckets.values())
     .sort((a, b) => a.time.localeCompare(b.time));
+};
+
+// Helper function to select best provider for a slot based on priority
+const selectBestProviderForSlot = (slotTime, availableCenters) => {
+  // If no centers provided, return null
+  if (!availableCenters || availableCenters.length === 0) {
+    console.log(`No centers provided for slot: ${slotTime}`);
+    return null;
+  }
+  
+  // Sort centers by priority (lowest number = highest priority)
+  const sortedCenters = availableCenters.sort((a, b) => a.priority - b.priority);
+  
+  if (sortedCenters.length === 1) {
+    const provider = sortedCenters[0];
+    console.log(`Single provider available for slot ${slotTime}: ${provider.centerName} (Priority: ${provider.priority})`);
+    return {
+      centerId: provider.centerId,
+      centerName: provider.centerName,
+      priority: provider.priority,
+      isFallback: false,
+      totalOptions: 1
+    };
+  }
+  
+  // Multiple providers - select highest priority (first in sorted array)
+  const selectedProvider = sortedCenters[0];
+  const isFallback = false; // First provider is always primary
+  
+  console.log(`Provider selection for slot ${slotTime}: ${selectedProvider.centerName} (Priority: ${selectedProvider.priority}) [PRIMARY]`);
+  
+  return {
+    centerId: selectedProvider.centerId,
+    centerName: selectedProvider.centerName,
+    priority: selectedProvider.priority,
+    isFallback: isFallback,
+    totalOptions: sortedCenters.length
+  };
 };
 
 // Helper function to merge hourly slots across multiple centers
@@ -719,15 +839,15 @@ const mergeHourlySlotsAcrossCenters = (hourlySlotsArray) => {
     .sort((a, b) => a.time.localeCompare(b.time));
 };
 
-// Create booking endpoint (supports single or multiple services)
+// Create booking endpoint (supports single or multiple centers and services)
 app.post('/api/bookings', async (req, res) => {
   try {
-    const { centerId, date, serviceId, serviceIds } = req.body;
+    const { centerId, centers, date, serviceId, serviceIds } = req.body;
     
-    if (!centerId || !date) {
+    if (!date) {
       res.status(400).json({
         success: false,
-        error: 'centerId and date are required'
+        error: 'date is required'
       });
       return;
     }
@@ -746,19 +866,110 @@ app.post('/api/bookings', async (req, res) => {
       return;
     }
     
-    const bookingData = await createZenotiBooking(centerId, date, services);
+    // Determine if single center or multiple centers
+    let targetCenters = [];
+    if (centers && Array.isArray(centers) && centers.length > 0) {
+      // Multiple centers
+      targetCenters = centers;
+    } else if (centerId) {
+      // Single center
+      targetCenters = [centerId];
+    } else {
+      res.status(400).json({
+        success: false,
+        error: 'Either centerId or centers array is required'
+      });
+      return;
+    }
+    
+    // If single center, return the original format for backward compatibility
+    if (targetCenters.length === 1) {
+      const bookingData = await createZenotiBooking(targetCenters[0], date, services);
+      
+      res.json({
+        success: true,
+        data: bookingData,
+        message: `Booking created for ${services.length} service(s) on ${date}`,
+        services: services
+      });
+      return;
+    }
+    
+    // Multiple centers - create bookings for all centers in parallel
+    console.log(`🎯 Creating bookings for ${targetCenters.length} centers on ${date}`);
+    
+    const bookingPromises = targetCenters.map(async (centerId) => {
+      try {
+        const bookingData = await createZenotiBooking(centerId, date, services);
+        
+        // Get provider information
+        const provider = getProviderById(centerId);
+        
+        return {
+          centerId,
+          centerName: provider?.name || 'Unknown Provider',
+          priority: provider?.priority || 999,
+          bookingId: bookingData.id,
+          bookingData,
+          success: true,
+          error: null
+        };
+      } catch (error) {
+        console.error(`Failed to create booking for center ${centerId}:`, error.message);
+        
+        // Get provider information even for failed bookings
+        const provider = getProviderById(centerId);
+        
+        return {
+          centerId,
+          centerName: provider?.name || 'Unknown Provider',
+          priority: provider?.priority || 999,
+          bookingId: null,
+          bookingData: null,
+          success: false,
+          error: error.message
+        };
+      }
+    });
+    
+    const bookingResults = await Promise.all(bookingPromises);
+    
+    // Separate successful and failed bookings
+    const successfulBookings = bookingResults.filter(result => result.success);
+    const failedBookings = bookingResults.filter(result => !result.success);
+    
+    // Sort by priority (lowest number = highest priority)
+    successfulBookings.sort((a, b) => a.priority - b.priority);
+    
+    console.log(`✅ Created ${successfulBookings.length} successful bookings, ${failedBookings.length} failed`);
     
     res.json({
       success: true,
-      data: bookingData,
-      message: `Booking created for ${services.length} service(s) on ${date}`,
-      services: services
+      data: {
+        bookings: bookingResults,
+        successfulBookings: successfulBookings,
+        failedBookings: failedBookings,
+        summary: {
+          totalCenters: targetCenters.length,
+          successful: successfulBookings.length,
+          failed: failedBookings.length,
+          date,
+          services
+        }
+      },
+      message: `Created bookings for ${successfulBookings.length}/${targetCenters.length} centers on ${date}`,
+      date,
+      services
     });
 
   } catch (error) {
+    console.error(`Error creating bookings:`, error.message);
+    
     res.status(500).json({
       success: false,
-      error: error.message
+      error: error.message,
+      date: req.body.date,
+      centers: req.body.centers || req.body.centerId
     });
   }
 });
@@ -767,13 +978,18 @@ app.post('/api/bookings', async (req, res) => {
 app.get('/api/bookings/:bookingId/slots', async (req, res) => {
   try {
     const { bookingId } = req.params;
+    const { check_future_day_availability } = req.query;
     
-    const slotsData = await fetchZenotiSlots(bookingId);
+    // Convert query parameter to boolean (default to true for future dates)
+    const includeFutureDays = check_future_day_availability !== 'false';
+    
+    const slotsData = await fetchZenotiSlots(bookingId, includeFutureDays);
     
     res.json({
       success: true,
       data: slotsData,
-      message: `Retrieved slots for booking ${bookingId}`
+      message: `Retrieved slots for booking ${bookingId}${includeFutureDays ? ' (including future days)' : ' (current day only)'}`,
+      check_future_day_availability: includeFutureDays
     });
 
   } catch (error) {
@@ -784,14 +1000,14 @@ app.get('/api/bookings/:bookingId/slots', async (req, res) => {
   }
 });
 
-// Unified slots endpoint for multiple centers and services
+// Unified slots endpoint for multiple centers and services (week-based selection only)
 app.post('/api/slots/unified', async (req, res) => {
   try {
-    const { centers, services, date, dates } = req.body;
+    const { centers, services, weeks = 4 } = req.body;
     
     if (!centers || !Array.isArray(centers) || centers.length === 0) {
       res.status(400).json({
-      success: false,
+        success: false,
         error: 'centers array is required'
       });
       return;
@@ -805,41 +1021,44 @@ app.post('/api/slots/unified', async (req, res) => {
       return;
     }
     
-    // Handle both single date and dates array, with 28-day limit
-    let targetDates = [];
-    if (dates && Array.isArray(dates) && dates.length > 0) {
-      targetDates = dates;
-    } else if (date) {
-      targetDates = [date];
-    } else {
-      res.status(400).json({
-        success: false,
-        error: 'Either date or dates array is required'
-      });
-      return;
-    }
+    // Always operate in week-based mode using Sunday as the week start
+    const weekDates = getWeekDates(weeks);
+    let targetDates = weekDates.map(week => week.date);
+    const weekInfo = weekDates;
+    console.log(`🗓️ Week-based mode: Generated ${targetDates.length} week start dates for ${weeks} weeks`);
     
     // Limit to 28 days (4 weeks) from current date
-    const today = new Date();
-    const maxDate = new Date(today.getTime() + (28 * 24 * 60 * 60 * 1000)); // 28 days from today
+    const now = new Date();
+    const todayStartUTC = new Date(Date.UTC(
+      now.getUTCFullYear(),
+      now.getUTCMonth(),
+      now.getUTCDate()
+    ));
+    const maxDate = new Date(todayStartUTC.getTime() + (28 * 24 * 60 * 60 * 1000)); // 28 days from today (inclusive)
     
     // Filter dates to only include those within 28 days
     targetDates = targetDates.filter(dateStr => {
-      const date = new Date(dateStr);
-      return date >= today && date <= maxDate;
+      const date = new Date(`${dateStr}T00:00:00Z`);
+      return date >= todayStartUTC && date <= maxDate;
     });
     
     if (targetDates.length === 0) {
       res.status(400).json({
         success: false,
-        error: 'No valid dates within 28-day range from today'
+        error: 'No valid week start dates within 28-day range from today'
       });
       return;
     }
 
+    // Process specific dates
+    console.log(`🚀 Processing week start dates: ${targetDates.length} dates for ${centers.length} centers`);
+    const startTime = Date.now();
+
     // Create all booking combinations in parallel for all dates
     const bookingPromises = [];
     const bookingMap = new Map(); // To track which booking belongs to which center/service/date
+    const bookingKeyFor = (centerId, dateStr) => `${centerId}::${dateStr}`;
+    const centerDateBookingMap = new Map();
     
     centers.forEach(centerId => {
       targetDates.forEach(date => {
@@ -848,6 +1067,7 @@ app.post('/api/slots/unified', async (req, res) => {
           .then(bookingData => {
             if (bookingData.id && !bookingData.error) {
               bookingMap.set(bookingData.id, { centerId, services, date, bookingData });
+              centerDateBookingMap.set(bookingKeyFor(centerId, date), bookingData.id);
               return { bookingId: bookingData.id, centerId, services, date, bookingData };
             }
             return { bookingId: null, centerId, services, date, error: bookingData.error };
@@ -867,34 +1087,45 @@ app.post('/api/slots/unified', async (req, res) => {
     const successfulBookings = bookingResults.filter(result => result.bookingId);
     
     if (successfulBookings.length === 0) {
-    res.json({
-      success: true,
+      res.json({
+        success: true,
         data: {
-          slots: [],
           centers: centers,
           services: services,
           dates: targetDates,
+          // Week-based information
+          week_info: weekInfo,
+          mode: 'week_based',
           total_combinations: bookingResults.length,
-          successful_combinations: 0
+          successful_combinations: 0,
+          available_dates: [],
+          weekly_availability: []
         },
-        message: 'No successful bookings created'
+        message: `No successful bookings created for ${weeks} weeks (${targetDates.length} dates)`
       });
       return;
     }
 
     // Fetch slots for all successful bookings in parallel
-    const slotsPromises = successfulBookings.map(async ({ bookingId, centerId, services, date }) => {
+    const initialSlotsResults = await Promise.all(successfulBookings.map(async ({ bookingId, centerId, services, date }) => {
       try {
-        const slotsData = await fetchZenotiSlots(bookingId);
+        const slotsData = await fetchZenotiSlots(bookingId, true);
         return {
           centerId,
           services,
           date,
           bookingId,
           slots: slotsData.slots || [],
-          error: slotsData.Error
+          futureDays: slotsData.future_days || slotsData.futureDays || [],
+          nextAvailableDay: slotsData.next_available_day || slotsData.nextAvailableDay || null,
+          error: slotsData.Error,
+          discoveredFromDates: [date],
+          discoveredFromBookingIds: [bookingId],
+          isFutureBooking: false,
+          sourceBookingId: bookingId,
+          sourceBookingDate: date
         };
-  } catch (error) {
+      } catch (error) {
         console.log(`Failed to fetch slots for booking ${bookingId}: ${error.message}`);
         return {
           centerId,
@@ -902,102 +1133,459 @@ app.post('/api/slots/unified', async (req, res) => {
           date,
           bookingId,
           slots: [],
-      error: error.message
+          futureDays: [],
+          nextAvailableDay: null,
+          error: error.message,
+          discoveredFromDates: [date],
+          discoveredFromBookingIds: [bookingId],
+          isFutureBooking: false,
+          sourceBookingId: bookingId,
+          sourceBookingDate: date
         };
       }
-    });
+    }));
 
-    const slotsResults = await Promise.all(slotsPromises);
-    
-    // Aggregate slots by date and center with hourly buckets
+    const allSlotsResults = [];
+    const resultQueue = [...initialSlotsResults];
+    const futureBookingQueue = [];
+    const futureBookingsCreated = [];
+    const futureBookingFailures = [];
+    const processedCenterDates = new Set();
+    const pendingFutureBookingKeys = new Set();
+
+    const futureDayAvailabilityMap = new Map();
+    const futureDayBookingMap = new Map();
+    const slotsByBookingId = new Map();
+
+    const registerFutureAvailability = (centerId, dateStr) => {
+      if (!dateStr) {
+        return;
+      }
+      if (!futureDayAvailabilityMap.has(centerId)) {
+        futureDayAvailabilityMap.set(centerId, new Set());
+      }
+      futureDayAvailabilityMap.get(centerId).add(dateStr);
+    };
+
+    const recordFutureBookingMap = (centerId, dateStr, bookingId) => {
+      if (!bookingId) {
+        return;
+      }
+      if (!futureDayBookingMap.has(centerId)) {
+        futureDayBookingMap.set(centerId, new Map());
+      }
+      futureDayBookingMap.get(centerId).set(dateStr, bookingId);
+    };
+
+    const futureBookingKeyFor = (centerId, dateStr) => `${centerId}::${dateStr}`;
+
+    const enqueueFutureBooking = ({ centerId, services, futureDate, discoveredFromBookingId, discoveredFromDate, discoveryTrailDates, discoveryTrailBookingIds }) => {
+      if (!futureDate) {
+        return;
+      }
+      const key = futureBookingKeyFor(centerId, futureDate);
+      if (processedCenterDates.has(key) || pendingFutureBookingKeys.has(key) || centerDateBookingMap.has(key)) {
+        return;
+      }
+      pendingFutureBookingKeys.add(key);
+      futureBookingQueue.push({
+        centerId,
+        services,
+        date: futureDate,
+        discoveredFromBookingId,
+        discoveredFromDate,
+        discoveryTrailDates,
+        discoveryTrailBookingIds
+      });
+    };
+
+    while (resultQueue.length > 0) {
+      const currentResult = resultQueue.shift();
+      const {
+        centerId,
+        services,
+        date,
+        bookingId,
+        slots,
+        futureDays,
+        nextAvailableDay,
+        error,
+        discoveredFromDates = [date],
+        discoveredFromBookingIds = bookingId ? [bookingId] : [],
+        isFutureBooking = false,
+        sourceBookingId,
+        sourceBookingDate
+      } = currentResult;
+
+      const centerDateKey = futureBookingKeyFor(centerId, date);
+
+      allSlotsResults.push({
+        centerId,
+        services,
+        date,
+        bookingId,
+        slots,
+        futureDays,
+        nextAvailableDay,
+        error,
+        discoveredFromDates,
+        discoveredFromBookingIds,
+        isFutureBooking,
+        sourceBookingId,
+        sourceBookingDate
+      });
+
+      processedCenterDates.add(centerDateKey);
+      pendingFutureBookingKeys.delete(centerDateKey);
+
+      if (bookingId) {
+        centerDateBookingMap.set(centerDateKey, bookingId);
+        recordFutureBookingMap(centerId, date, bookingId);
+      }
+
+      const futureAvailableDates = Array.isArray(futureDays)
+        ? futureDays
+            .filter(day => (day?.IsAvailable ?? day?.isAvailable) === true)
+            .map(day => {
+              const rawDay = day?.Day || day?.day || day?.date;
+              if (!rawDay) {
+                return null;
+              }
+              return rawDay.split('T')[0];
+            })
+            .filter(Boolean)
+        : [];
+
+      futureAvailableDates.forEach(futureDate => {
+        registerFutureAvailability(centerId, futureDate);
+        const updatedTrailDates = [...discoveredFromDates, futureDate];
+        const updatedTrailBookingIds = [...discoveredFromBookingIds];
+        if (bookingId && !updatedTrailBookingIds.includes(bookingId)) {
+          updatedTrailBookingIds.push(bookingId);
+        }
+        enqueueFutureBooking({
+          centerId,
+          services,
+          futureDate,
+          discoveredFromBookingId: bookingId,
+          discoveredFromDate: date,
+          discoveryTrailDates: updatedTrailDates,
+          discoveryTrailBookingIds: updatedTrailBookingIds
+        });
+      });
+
+      if (resultQueue.length === 0 && futureBookingQueue.length > 0) {
+        const bookingsToProcess = futureBookingQueue.splice(0);
+    const futureResults = await Promise.all(bookingsToProcess.map(async item => {
+          const {
+            centerId: futureCenterId,
+            services: futureServices,
+            date: futureDate,
+            discoveredFromBookingId,
+            discoveredFromDate,
+            discoveryTrailDates,
+            discoveryTrailBookingIds
+          } = item;
+          const futureKey = futureBookingKeyFor(futureCenterId, futureDate);
+
+          try {
+            const bookingData = await createZenotiBooking(futureCenterId, futureDate, futureServices);
+            if (!bookingData?.id) {
+              futureBookingFailures.push({
+                centerId: futureCenterId,
+                date: futureDate,
+                services: futureServices,
+                discoveredFromBookingId,
+                discoveredFromDate,
+                error: bookingData?.error || 'Unknown error creating future booking'
+              });
+              pendingFutureBookingKeys.delete(futureKey);
+              return null;
+            }
+
+            bookingMap.set(bookingData.id, { centerId: futureCenterId, services: futureServices, date: futureDate, bookingData });
+            centerDateBookingMap.set(futureKey, bookingData.id);
+
+            const slotsData = await fetchZenotiSlots(bookingData.id, true);
+
+            const result = {
+              centerId: futureCenterId,
+              services: futureServices,
+              date: futureDate,
+              bookingId: bookingData.id,
+              slots: slotsData.slots || [],
+              futureDays: slotsData.future_days || slotsData.futureDays || [],
+              nextAvailableDay: slotsData.next_available_day || slotsData.nextAvailableDay || null,
+              error: slotsData.Error,
+              discoveredFromDates: discoveryTrailDates.length > 0 ? discoveryTrailDates : [futureDate],
+              discoveredFromBookingIds: discoveryTrailBookingIds.length > 0 ? discoveryTrailBookingIds : (discoveredFromBookingId ? [discoveredFromBookingId] : []),
+              isFutureBooking: true,
+              sourceBookingId: discoveredFromBookingId || null,
+              sourceBookingDate: discoveredFromDate || null
+            };
+
+            futureBookingsCreated.push({
+              centerId: futureCenterId,
+              services: futureServices,
+              date: futureDate,
+              bookingId: bookingData.id,
+              source_booking_id: discoveredFromBookingId || null,
+              source_booking_date: discoveredFromDate || null
+            });
+
+            registerFutureAvailability(futureCenterId, futureDate);
+            recordFutureBookingMap(futureCenterId, futureDate, bookingData.id);
+
+            return result;
+          } catch (err) {
+            console.log(`Failed to create/fetch future booking for center ${futureCenterId}, date ${futureDate}: ${err.message}`);
+            futureBookingFailures.push({
+              centerId: futureCenterId,
+              date: futureDate,
+              services: futureServices,
+              discoveredFromBookingId,
+              discoveredFromDate,
+              error: err.message
+            });
+            pendingFutureBookingKeys.delete(futureKey);
+            return null;
+          } finally {
+            pendingFutureBookingKeys.delete(futureKey);
+          }
+        }));
+
+        futureResults
+          .filter(Boolean)
+          .forEach(result => {
+            resultQueue.push(result);
+          });
+      }
+    }
+
     const slotsByDate = {};
+    const dateAvailability = {};
+    const weeklyAvailabilityMap = new Map();
     
-    slotsResults.forEach(result => {
-      const { centerId, services, date, slots, error } = result;
-      
+    allSlotsResults.forEach(result => {
+      const {
+        centerId,
+        services,
+        date,
+        bookingId,
+        slots,
+        futureDays,
+        nextAvailableDay,
+        error,
+        discoveredFromDates,
+        discoveredFromBookingIds,
+        isFutureBooking,
+        sourceBookingId,
+        sourceBookingDate
+      } = result;
+
+      const availableSlotsCount = Array.isArray(slots)
+        ? slots.filter(slot => slot.Available).length
+        : 0;
+
+      const hourlyBuckets = aggregateSlotsIntoHourlyBuckets(slots || []);
+
       if (!slotsByDate[date]) {
         slotsByDate[date] = {};
       }
-      
-      if (!slotsByDate[date][centerId]) {
-        // Aggregate 15-minute slots into 1-hour buckets (primary response)
-        const availableSlots = slots.filter(slot => slot.Available);
-        const hourlyBuckets = aggregateSlotsIntoHourlyBuckets(availableSlots);
-        
-        slotsByDate[date][centerId] = {
-          hourly_slots: hourlyBuckets, // Primary: 1-hour aggregated slots only
-          services: services,
-          error: error
-        };
+
+      slotsByDate[date][centerId] = {
+        services,
+        slots,
+        hourly_buckets: hourlyBuckets,
+        available_slots_count: availableSlotsCount,
+        has_slots: availableSlotsCount > 0,
+        booking_id: bookingId,
+        is_future_booking: !!isFutureBooking,
+        discovered_from_dates: discoveredFromDates,
+        discovered_from_booking_ids: discoveredFromBookingIds,
+        source_booking_id: sourceBookingId,
+        source_booking_date: sourceBookingDate,
+        next_available_day: nextAvailableDay || null,
+        error
+      };
+
+      if (bookingId) {
+        slotsByBookingId.set(bookingId, {
+          centerId,
+          services,
+          date,
+          slots,
+          hourly_buckets: hourlyBuckets,
+          available_slots_count: availableSlotsCount,
+          has_slots: availableSlotsCount > 0,
+          is_future_booking: !!isFutureBooking,
+          discovered_from_dates: discoveredFromDates,
+          discovered_from_booking_ids: discoveredFromBookingIds,
+          source_booking_id: sourceBookingId,
+          source_booking_date: sourceBookingDate,
+          next_available_day: nextAvailableDay || null,
+          error
+        });
+      }
+
+      const futureAvailableDates = Array.isArray(futureDays)
+        ? futureDays
+            .filter(day => (day?.IsAvailable ?? day?.isAvailable) === true)
+            .map(day => {
+              const rawDay = day?.Day || day?.day || day?.date;
+              if (!rawDay) {
+                return null;
+              }
+              return rawDay.split('T')[0];
+            })
+            .filter(Boolean)
+        : [];
+
+      futureAvailableDates.forEach(futureDate => {
+        registerFutureAvailability(centerId, futureDate);
+      });
+    });
+
+    const sortedRelevantDates = Object.keys(slotsByDate).sort((a, b) => a.localeCompare(b));
+
+    sortedRelevantDates.forEach(date => {
+      const centerEntries = Object.entries(slotsByDate[date] || {});
+
+      const totalAvailableSlots = centerEntries.reduce((total, [, centerData]) => {
+        return total + (centerData.available_slots_count || 0);
+      }, 0);
+
+      const centersWithAvailabilityDetails = centerEntries
+        .filter(([, centerData]) => centerData.has_slots)
+        .map(([centerId, centerData]) => {
+          const provider = getProviderById(centerId);
+          const hourlySlots = Array.isArray(centerData.hourly_buckets)
+            ? centerData.hourly_buckets
+                .filter(bucket => bucket?.time && bucket.available !== false && (bucket.count ?? 0) > 0)
+                .map(bucket => ({
+                  time: bucket.time,
+                  available: bucket.available !== false,
+                  count: bucket.count ?? 0
+                }))
+            : [];
+
+          const slotTimes = Array.isArray(centerData.slots)
+            ? centerData.slots
+                .filter(slot => slot?.Available)
+                .map(slot => ({ time: slot.Time || slot.time || slot.start_time || null }))
+                .filter(slot => !!slot.time)
+            : [];
+
+          return {
+            id: centerId,
+            no_of_slots: centerData.available_slots_count || 0,
+            hourly_slots: hourlySlots,
+            slots: slotTimes,
+            booking_id: centerData.booking_id || centerData.source_booking_id || null,
+            priority: provider?.priority ?? null
+          };
+        })
+        .sort((a, b) => (a.priority ?? 999) - (b.priority ?? 999));
+
+      const centersWithAvailability = centersWithAvailabilityDetails.length;
+      const hasSlots = centersWithAvailability > 0;
+
+      dateAvailability[date] = {
+        hasSlots,
+        centersWithAvailability,
+        totalAvailableSlots,
+        center_ids: centersWithAvailabilityDetails
+      };
+
+      if (hasSlots) {
+        const weekStart = getWeekStartDate(date);
+        if (!weeklyAvailabilityMap.has(weekStart)) {
+          weeklyAvailabilityMap.set(weekStart, new Set());
+        }
+        weeklyAvailabilityMap.get(weekStart).add(date);
       }
     });
     
-    // Create flatter structure for frontend with hourly aggregation
-    const dateAvailability = {};
-    const allSlotsByDate = {};
-    
-    targetDates.forEach(date => {
-      const dateData = slotsByDate[date] || {};
-      let hasSlots = false;
-      let hourlySlotsCount = 0;
-      let allHourlySlots = [];
-      let centersWithSlots = [];
-      
-      // Process all centers for this date
-      Object.entries(dateData).forEach(([centerId, centerData]) => {
-        if (centerData.hourly_slots && centerData.hourly_slots.length > 0) {
-          hasSlots = true;
-          hourlySlotsCount += centerData.hourly_slots.length;
-          allHourlySlots = allHourlySlots.concat(centerData.hourly_slots);
-          
-          centersWithSlots.push({
-            centerId,
-            hourly_slots: centerData.hourly_slots,
-            services: centerData.services
-          });
-        }
+    const weeklyAvailability = Array.from(weeklyAvailabilityMap.entries()).map(([weekStart, datesSet]) => {
+      const sortedDates = Array.from(datesSet).sort((a, b) => a.localeCompare(b));
+      const matchedWeek = weekInfo?.find(week => getWeekStartDate(week.date) === weekStart);
+      return {
+        week_start: weekStart,
+        week_label: matchedWeek?.weekName || `Week starting ${weekStart}`,
+        available_dates: sortedDates
+      };
+    }).sort((a, b) => a.week_start.localeCompare(b.week_start));
+
+    const availableDates = sortedRelevantDates.filter(date => dateAvailability[date]?.hasSlots);
+
+    const futureDayAvailability = Array.from(futureDayAvailabilityMap.entries()).map(([centerId, datesSet]) => ({
+      centerId,
+      available_dates: Array.from(datesSet).sort((a, b) => a.localeCompare(b))
+    }));
+
+    const futureDayBookings = Array.from(futureDayBookingMap.entries()).map(([centerId, bookingsMap]) => ({
+      centerId,
+      bookings: Array.from(bookingsMap.entries())
+        .sort((a, b) => a[0].localeCompare(b[0]))
+        .map(([date, bookingId]) => ({ date, bookingId }))
+    }));
+
+    const detailedSlotsByBooking = Object.fromEntries(Array.from(slotsByBookingId.entries()));
+
+    const processingTime = Date.now() - startTime;
+    const totalFutureBookingsCreated = futureBookingsCreated.length;
+
+    const bookingMappingList = [];
+    const bookingMappingSeen = new Set();
+
+    const pushBookingMapping = ({ centerId, services, date, bookingId, isFutureBooking = false, sourceBookingId = null, sourceBookingDate = null }) => {
+      if (!bookingId || bookingMappingSeen.has(bookingId)) {
+        return;
+      }
+      bookingMappingSeen.add(bookingId);
+      bookingMappingList.push({
+        centerId,
+        services,
+        date,
+        bookingId,
+        is_future_booking: isFutureBooking,
+        source_booking_id: sourceBookingId,
+        source_booking_date: sourceBookingDate
       });
-      
-      // Deduplicate and merge hourly slots across centers
-      const mergedHourlySlots = mergeHourlySlotsAcrossCenters(allHourlySlots);
-      
-      dateAvailability[date] = {
-        hasSlots,
-        hourlySlotsCount: mergedHourlySlots.length,
-        centersCount: centersWithSlots.length
-      };
-      
-      allSlotsByDate[date] = {
-        hasSlots,
-        hourlySlotsCount: mergedHourlySlots.length,
-        hourly_slots: mergedHourlySlots, // Primary: 1-hour aggregated slots only
-        centers: centersWithSlots
-      };
+    };
+
+    successfulBookings.forEach(booking => {
+      pushBookingMapping({
+        centerId: booking.centerId,
+        services: booking.services,
+        date: booking.date,
+        bookingId: booking.bookingId,
+        isFutureBooking: false
+      });
+    });
+
+    futureBookingsCreated.forEach(booking => {
+      pushBookingMapping({
+        centerId: booking.centerId,
+        services: booking.services,
+        date: booking.date,
+        bookingId: booking.bookingId,
+        isFutureBooking: true,
+        sourceBookingId: booking.source_booking_id,
+        sourceBookingDate: booking.source_booking_date
+      });
     });
     
     res.json({
       success: true,
       data: {
-        // New flatter structure for frontend with hourly aggregation
         date_availability: dateAvailability,
-        slots_by_date: allSlotsByDate,
-        // Keep original structure for backward compatibility
-        slots_by_center: slotsByDate,
+        available_dates: availableDates,
         centers: centers,
         services: services,
-        dates: targetDates,
-        total_combinations: bookingResults.length,
-        successful_combinations: successfulBookings.length,
-        failed_combinations: bookingResults.length - successfulBookings.length,
-        // Performance metrics
-        aggregation_info: {
-          original_slots: slotsResults.reduce((total, result) => total + (result.slots?.length || 0), 0),
-          hourly_slots: Object.values(allSlotsByDate).reduce((total, dateData) => total + (dateData.hourly_slots?.length || 0), 0),
-          reduction_percentage: Math.round((1 - Object.values(allSlotsByDate).reduce((total, dateData) => total + (dateData.hourly_slots?.length || 0), 0) / Math.max(1, slotsResults.reduce((total, result) => total + (result.slots?.length || 0), 0))) * 100),
-          optimization_note: "Response contains only hourly_slots for optimal performance"
-        }
+        processing_time_ms: processingTime
       },
-      message: `Retrieved slots for ${successfulBookings.length} successful booking combinations across ${targetDates.length} dates (28-day limit). Aggregated ${slotsResults.reduce((total, result) => total + (result.slots?.length || 0), 0)} 15-min slots into ${Object.values(allSlotsByDate).reduce((total, dateData) => total + (dateData.hourly_slots?.length || 0), 0)} hourly slots.`
+      message: `Retrieved availability for ${successfulBookings.length} center/date booking combinations in ${processingTime}ms.`
     });
 
   } catch (error) {
@@ -1067,24 +1655,395 @@ app.get('/api/categories', async (req, res) => {
 
 // Statistics endpoint
 
-// Rate limit status endpoint
-app.get('/api/rate-limit/status', (req, res) => {
-  const now = Date.now();
-  const timeSinceWindowStart = now - rateLimitTracker.windowStart;
-  const remainingTime = Math.max(0, 60000 - timeSinceWindowStart);
+// Booking Management endpoints (Reserve, Confirm, Status, Cancel)
+
+// Reserve a specific slot
+app.post('/api/bookings/:bookingId/reserve', async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    const { slot_time } = req.body;
+    
+    if (!slot_time) {
+      res.status(400).json({
+        success: false,
+        error: 'slot_time is required'
+      });
+      return;
+    }
+    
+    const zenotiApiKey = process.env.ZENOTI_API_KEY;
+    const zenotiBaseUrl = process.env.ZENOTI_BASE_URL || 'https://api.zenoti.com/v1';
+    
+    if (!zenotiApiKey) {
+      throw new Error('Zenoti API key not configured');
+    }
+    
+    // Format slot_time to ensure proper format
+    const formattedSlotTime = new Date(slot_time).toISOString();
+    
+    const reservePayload = {
+      slot_time: formattedSlotTime
+    };
+    
+    console.log(`Reserving slot for booking ${bookingId} at ${formattedSlotTime}`);
+    
+    const response = await makeZenotiRequest(async () => {
+      return await axios.post(`${zenotiBaseUrl}/bookings/${bookingId}/slots/reserve`, reservePayload, {
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `apikey ${zenotiApiKey}`
+        }
+      });
+    });
+    
+    res.json({
+      success: true,
+      data: response.data,
+      message: `Slot reserved successfully for booking ${bookingId}`,
+      booking_id: bookingId,
+      slot_time: formattedSlotTime
+    });
+    
+  } catch (error) {
+    console.error(`Error reserving slot for booking ${req.params.bookingId}:`, error.message);
+    if (error.response) {
+      console.error('Zenoti API response status:', error.response.status);
+      console.error('Zenoti API response data:', error.response.data);
+    }
+    
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      booking_id: req.params.bookingId
+    });
+  }
+});
+
+// Confirm a service booking
+app.post('/api/bookings/:bookingId/confirm', async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    const { guest, payment_method, notes } = req.body;
+    
+    if (!guest) {
+      res.status(400).json({
+        success: false,
+        error: 'guest information is required'
+      });
+      return;
+    }
+    
+    const zenotiApiKey = process.env.ZENOTI_API_KEY;
+    const zenotiBaseUrl = process.env.ZENOTI_BASE_URL || 'https://api.zenoti.com/v1';
+    
+    if (!zenotiApiKey) {
+      throw new Error('Zenoti API key not configured');
+    }
+    
+    const confirmPayload = {
+      guest: {
+        id: guest.id || null,
+        first_name: guest.first_name || guest.firstName,
+        last_name: guest.last_name || guest.lastName,
+        email: guest.email,
+        phone: guest.phone,
+        date_of_birth: guest.date_of_birth || guest.dateOfBirth,
+        gender: guest.gender,
+        address: guest.address ? {
+          street: guest.address.street,
+          city: guest.address.city,
+          state: guest.address.state,
+          zip_code: guest.address.zip_code || guest.address.zipCode,
+          country: guest.address.country || 'US'
+        } : undefined
+      },
+      payment_method: payment_method || 'credit_card',
+      notes: notes || ''
+    };
+    
+    console.log(`Confirming booking ${bookingId} for guest:`, confirmPayload.guest.first_name, confirmPayload.guest.last_name);
+    
+    const response = await makeZenotiRequest(async () => {
+      return await axios.post(`${zenotiBaseUrl}/bookings/${bookingId}/confirm`, confirmPayload, {
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `apikey ${zenotiApiKey}`
+        }
+      });
+    });
+    
+    res.json({
+      success: true,
+      data: response.data,
+      message: `Booking ${bookingId} confirmed successfully`,
+      booking_id: bookingId,
+      confirmation_number: response.data.confirmation_number,
+      appointment_id: response.data.appointment_id,
+      invoice_id: response.data.invoice_id
+    });
+    
+  } catch (error) {
+    console.error(`Error confirming booking ${req.params.bookingId}:`, error.message);
+    if (error.response) {
+      console.error('Zenoti API response status:', error.response.status);
+      console.error('Zenoti API response data:', error.response.data);
+    }
+    
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      booking_id: req.params.bookingId
+    });
+  }
+});
+
+// Get booking status
+app.get('/api/bookings/:bookingId/status', async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    
+    const zenotiApiKey = process.env.ZENOTI_API_KEY;
+    const zenotiBaseUrl = process.env.ZENOTI_BASE_URL || 'https://api.zenoti.com/v1';
+    
+    if (!zenotiApiKey) {
+      throw new Error('Zenoti API key not configured');
+    }
+    
+    const response = await makeZenotiRequest(async () => {
+      return await axios.get(`${zenotiBaseUrl}/bookings/${bookingId}`, {
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `apikey ${zenotiApiKey}`
+        }
+      });
+    });
+    
+    res.json({
+      success: true,
+      data: response.data,
+      message: `Booking status retrieved for ${bookingId}`,
+      booking_id: bookingId
+    });
+    
+  } catch (error) {
+    console.error(`Error getting booking status for ${req.params.bookingId}:`, error.message);
+    if (error.response) {
+      console.error('Zenoti API response status:', error.response.status);
+      console.error('Zenoti API response data:', error.response.data);
+    }
+    
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      booking_id: req.params.bookingId
+    });
+  }
+});
+
+// Cancel reservation
+app.delete('/api/bookings/:bookingId/reserve', async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    
+    const zenotiApiKey = process.env.ZENOTI_API_KEY;
+    const zenotiBaseUrl = process.env.ZENOTI_BASE_URL || 'https://api.zenoti.com/v1';
+    
+    if (!zenotiApiKey) {
+      throw new Error('Zenoti API key not configured');
+    }
+    
+    const response = await makeZenotiRequest(async () => {
+      return await axios.delete(`${zenotiBaseUrl}/bookings/${bookingId}/slots/reserve`, {
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `apikey ${zenotiApiKey}`
+        }
+      });
+    });
+    
+    res.json({
+      success: true,
+      data: response.data,
+      message: `Reservation cancelled for booking ${bookingId}`,
+      booking_id: bookingId
+    });
+    
+  } catch (error) {
+    console.error(`Error cancelling reservation for booking ${req.params.bookingId}:`, error.message);
+    if (error.response) {
+      console.error('Zenoti API response status:', error.response.status);
+      console.error('Zenoti API response data:', error.response.data);
+    }
+    
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      booking_id: req.params.bookingId
+    });
+  }
+});
+
+// Select best provider for a specific slot with single booking ID (called when user clicks "next")
+app.post('/api/slots/select-provider', async (req, res) => {
+  try {
+    const { slotTime, date, bookingId } = req.body;
+    
+    // Debug logging
+    console.log('🎯 Provider selection request received:', {
+      slotTime,
+      date,
+      bookingId,
+      timestamp: new Date().toISOString()
+    });
+    
+    if (!slotTime || !date || !bookingId) {
+      console.log('❌ Validation failed:', { slotTime, date, bookingId });
+      res.status(400).json({
+        success: false,
+        error: 'slotTime, date, and bookingId are required',
+        received: { slotTime, date, bookingId }
+      });
+      return;
+    }
+    
+    // Get booking details from Zenoti API to extract center information
+    const zenotiApiKey = process.env.ZENOTI_API_KEY;
+    const zenotiBaseUrl = process.env.ZENOTI_BASE_URL || 'https://api.zenoti.com/v1';
+    
+    if (!zenotiApiKey) {
+      throw new Error('Zenoti API key not configured');
+    }
+    
+    let bookingData;
+    try {
+      const response = await makeZenotiRequest(async () => {
+        return await axios.get(`${zenotiBaseUrl}/bookings/${bookingId}`, {
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `apikey ${zenotiApiKey}`
+          }
+        });
+      });
+      bookingData = response.data;
+    } catch (error) {
+      console.error(`Failed to fetch booking ${bookingId}:`, error.message);
+      res.status(404).json({
+        success: false,
+        error: 'Booking not found or invalid booking ID',
+        bookingId,
+        slotTime,
+        date
+      });
+      return;
+    }
+    
+    // Extract center ID from booking data
+    const centerId = bookingData.center_id;
+    if (!centerId) {
+      console.log('❌ No center_id found in booking data:', bookingData);
+      res.status(400).json({
+        success: false,
+        error: 'Invalid booking data - no center information found',
+        bookingId,
+        slotTime,
+        date
+      });
+      return;
+    }
+    
+    // Get provider information
+    const provider = getProviderById(centerId);
+    
+    if (!provider) {
+      console.log('❌ Provider not found for centerId:', centerId);
+      res.status(404).json({
+        success: false,
+        error: 'Provider not found for the given centerId',
+        centerId,
+        bookingId,
+        slotTime,
+        date
+      });
+      return;
+    }
+    
+    // Log the selection for analytics
+    console.log(`🎯 Provider selected for slot ${slotTime} on ${date}:`, {
+      provider: provider.name,
+      priority: provider.priority,
+      bookingId: bookingId,
+      centerId: centerId,
+      timestamp: new Date().toISOString()
+    });
     
     res.json({
       success: true,
       data: {
-      calls_made: rateLimitTracker.calls,
-      max_calls_per_minute: rateLimitTracker.maxCallsPerMinute,
-      remaining_calls: Math.max(0, rateLimitTracker.maxCallsPerMinute - rateLimitTracker.calls),
-      window_reset_in_ms: remainingTime,
-      window_reset_in_seconds: Math.ceil(remainingTime / 1000),
+        selectedProvider: {
+          centerId: centerId,
+          centerName: provider.name,
+          priority: provider.priority,
+          bookingId: bookingId,
+          isFallback: false,
+          totalOptions: 1
+        },
+        slotTime,
+        date,
+        selectionReason: 'single_provider'
+      },
+      message: `Provider selected for slot ${slotTime} with booking ID: ${bookingId}`,
+      slotTime,
+      date
+    });
+    
+  } catch (error) {
+    console.error(`Error selecting provider for slot:`, error.message);
+    
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      slotTime: req.body.slotTime,
+      date: req.body.date
+    });
+  }
+});
+
+
+
+
+
+// Rate limit status endpoint
+app.get('/api/rate-limit/status', (req, res) => {
+  const now = Date.now();
+  res.json({
+    success: true,
+    data: {
       cache_size: cache.size
     },
     message: 'Rate limit status retrieved successfully'
   });
+});
+
+// Clear cache endpoint
+app.post('/api/cache/clear', (req, res) => {
+  try {
+    const cacheSize = cache.size;
+    cache.clear();
+    
+    // Reset rate limiting
+    res.json({
+      success: true,
+      message: `Cache cleared successfully. Removed ${cacheSize} entries.`,
+      cache_size_before: cacheSize,
+      cache_size_after: 0,
+      rate_limit_reset: true
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
 });
 
 // 404 handler
@@ -1102,10 +2061,18 @@ app.use((req, res) => {
       'POST /api/address/centers',
       'GET /api/services/category/:categoryId',
       'GET /api/categories',
-      'POST /api/bookings',
-      'GET /api/bookings/:bookingId/slots',
+      'POST /api/bookings (single or multiple centers)',
+      'GET /api/bookings/:bookingId/slots?check_future_day_availability=true',
       'POST /api/slots/unified',
-      'GET /api/rate-limit/status'
+      'POST /api/slots/select-provider',
+      'GET /api/slots/test-provider-selection',
+      'GET /api/slots/test-week-dates',
+      'POST /api/bookings/:bookingId/reserve',
+      'POST /api/bookings/:bookingId/confirm',
+      'GET /api/bookings/:bookingId/status',
+      'DELETE /api/bookings/:bookingId/reserve',
+      'GET /api/rate-limit/status',
+      'POST /api/cache/clear'
     ]
   });
 });
@@ -1126,13 +2093,18 @@ app.listen(PORT, () => {
   console.log(`   - POST /api/address/validate`);
   console.log(`   - POST /api/address/centers`);
   console.log(`   - GET /api/categories (with services)`);
-  console.log(`   - POST /api/bookings`);
-  console.log(`   - GET /api/bookings/:bookingId/slots`);
-  console.log(`   - POST /api/slots/unified (with hourly aggregation)`);
+  console.log(`   - POST /api/bookings (single or multiple centers)`);
+  console.log(`   - GET /api/bookings/:bookingId/slots (with future day availability)`);
+  console.log(`   - POST /api/slots/unified (with hourly aggregation and week-based selection)`);
+  console.log(`   - POST /api/slots/select-provider (priority-based selection with booking IDs)`);
+  console.log(`   - POST /api/bookings/:bookingId/reserve`);
+  console.log(`   - POST /api/bookings/:bookingId/confirm`);
+  console.log(`   - GET /api/bookings/:bookingId/status`);
+  console.log(`   - DELETE /api/bookings/:bookingId/reserve`);
   console.log(`   - GET /api/rate-limit/status`);
   console.log(`\n🎯 Test with: curl http://localhost:${PORT}/api/providers/zipcode/48236`);
   console.log(`📊 Rate limit status: curl http://localhost:${PORT}/api/rate-limit/status`);
-  console.log(`🕐 Hourly slots: Frontend uses 'hourly_slots' array only (optimized for performance)`);
+  console.log(`🕐 Slots: Frontend can use both 'hourly_slots' (optimized) and 'individual_slots' (detailed)`);
 });
 
 export default app;
