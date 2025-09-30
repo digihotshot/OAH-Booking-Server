@@ -2013,8 +2013,8 @@ app.post('/api/bookings/:bookingId/reserve', async (req, res) => {
     console.log('[DEBUG] Request body type:', typeof req.body);
     
     // Accept slot_time from either query params or body
-    const slotTime = req.query.slot_time || req.body.slot_time;
-    const createInvoice = req.query.create_invoice === 'true' || req.body.create_invoice || false;
+    const slotTime = req.query.slot_time || req.body?.slot_time;
+    const createInvoice = req.query.create_invoice === 'true' || req.body?.create_invoice || false;
 
     const result = await reserveSlotInZenoti({
       bookingId,
