@@ -14,6 +14,7 @@ const PORT = process.env.PORT || 3000;
 // Middleware
 app.use(cors());
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
 // Helper functions
 const getProvidersByZipcode = (zipcode) => {
@@ -171,6 +172,304 @@ const makeZenotiRequest = async (requestFn, retryCount = 0) => {
     }
     
     // Re-throw non-rate-limit errors
+    throw error;
+  }
+};
+
+class ApiValidationError extends Error {
+  constructor(message, statusCode = 400, details = null) {
+    super(message);
+    this.name = 'ApiValidationError';
+    this.statusCode = statusCode;
+    this.details = details;
+  }
+}
+
+const getZenotiConfig = () => {
+  const zenotiApiKey = process.env.ZENOTI_API_KEY;
+  const zenotiBaseUrl = process.env.ZENOTI_BASE_URL || 'https://api.zenoti.com/v1';
+
+  if (!zenotiApiKey) {
+    throw new Error('Zenoti API key not configured');
+  }
+
+  return { zenotiApiKey, zenotiBaseUrl };
+};
+
+const sanitizePhoneForZenoti = (phone) => {
+  if (!phone) {
+    throw new ApiValidationError('phone number is required', 400);
+  }
+
+  const digits = String(phone).replace(/\D/g, '');
+  if (!digits) {
+    throw new ApiValidationError('phone number must contain digits', 400);
+  }
+
+  let zenotiDigits = digits;
+  if (digits.length === 10) {
+    zenotiDigits = digits.substring(1);
+  } else if (digits.length !== 9) {
+    throw new ApiValidationError('phone number must be 9 or 10 digits', 400);
+  }
+
+  return {
+    original: digits,
+    zenoti: zenotiDigits
+  };
+};
+
+const resolveGuestNames = ({ name, firstName, lastName }) => {
+  let resolvedFirstName = firstName ? String(firstName).trim() : '';
+  let resolvedLastName = lastName ? String(lastName).trim() : '';
+
+  if (!resolvedFirstName) {
+    const combinedName = name ? String(name).trim() : '';
+    if (combinedName) {
+      const parts = combinedName.split(/\s+/);
+      resolvedFirstName = parts.shift();
+      const remaining = parts.join(' ');
+      if (!resolvedLastName && remaining) {
+        resolvedLastName = remaining;
+      }
+    }
+  }
+
+  if (!resolvedFirstName) {
+    throw new ApiValidationError('guest first name is required', 400);
+  }
+
+  if (!resolvedLastName) {
+    resolvedLastName = '';
+  }
+
+  return {
+    firstName: resolvedFirstName,
+    lastName: resolvedLastName
+  };
+};
+
+const createGuestInZenoti = async ({ centerId, name, firstName, lastName, email, phone }) => {
+  if (!centerId) {
+    throw new ApiValidationError('center_id (provider_id) is required', 400);
+  }
+
+  if (!email) {
+    throw new ApiValidationError('email is required', 400);
+  }
+
+  const { firstName: resolvedFirstName, lastName: resolvedLastName } = resolveGuestNames({
+    name,
+    firstName,
+    lastName
+  });
+
+  const { original: sanitizedPhone, zenoti: phoneForZenoti } = sanitizePhoneForZenoti(phone);
+
+  const guestPayload = {
+    center_id: centerId,
+    personal_info: {
+      first_name: resolvedFirstName,
+      last_name: resolvedLastName,
+      email,
+      mobile_phone: {
+        country_code: '+1',
+        number: phoneForZenoti
+      }
+    }
+  };
+
+  const { zenotiApiKey, zenotiBaseUrl } = getZenotiConfig();
+
+  const response = await makeZenotiRequest(async () => {
+    return await axios.post(`${zenotiBaseUrl}/guests`, guestPayload, {
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `apikey ${zenotiApiKey}`
+      }
+    });
+  });
+
+  return {
+    data: response.data,
+    payload: guestPayload,
+    sanitizedPhone,
+    phoneForZenoti,
+    resolvedFirstName,
+    resolvedLastName
+  };
+};
+
+const createBookingInZenoti = async ({ centerId, date, guestId, serviceIds }) => {
+  if (!centerId) {
+    throw new ApiValidationError('center_id (provider_id) is required', 400);
+  }
+
+  if (!date) {
+    throw new ApiValidationError('date is required', 400);
+  }
+
+  if (!guestId) {
+    throw new ApiValidationError('guest_id is required', 400);
+  }
+
+  if (!Array.isArray(serviceIds) || serviceIds.length === 0) {
+    throw new ApiValidationError('service_ids must be a non-empty array', 400);
+  }
+
+  const normalizedDate = new Date(`${date}T00:00:00Z`);
+  if (Number.isNaN(normalizedDate.getTime())) {
+    throw new ApiValidationError('date must be a valid YYYY-MM-DD string', 400);
+  }
+
+  const items = serviceIds.map((serviceId, index) => {
+    if (!serviceId || (typeof serviceId !== 'string' && typeof serviceId !== 'number')) {
+      const error = new ApiValidationError(
+        'service_ids must only contain service IDs. For multiple treatments, use one entry per service ID.',
+        400,
+        {
+          index,
+          service_input: serviceId,
+          service_ids_type: serviceIds.map((value) => typeof value)
+        }
+      );
+
+    /*
+    TODO: Once logging infrastructure is in place, add a structured log (e.g. to pino) here with:
+        {
+          error: error.message,
+          details: error.details,
+          center_id: centerId,
+          guest_id: guestId,
+          date
+        }
+    so we can trace payload issues in prod without exposing them to the client.
+    */
+
+      throw error;
+    }
+
+    return {
+      item: { id: String(serviceId).trim() }
+    };
+  });
+
+  const bookingPayload = {
+    center_id: centerId,
+    date: normalizedDate.toISOString().split('T')[0],
+    guests: [
+      {
+        id: guestId,
+      items
+      }
+    ]
+  };
+
+  const { zenotiApiKey, zenotiBaseUrl } = getZenotiConfig();
+
+  try {
+    console.log('[createBookingInZenoti] Request payload', bookingPayload);
+
+    const response = await makeZenotiRequest(async () => {
+      return await axios.post(`${zenotiBaseUrl}/bookings?is_double_booking_enabled=false`, bookingPayload, {
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `apikey ${zenotiApiKey}`
+        }
+      });
+    });
+
+    console.log('[createBookingInZenoti] Booking created', {
+      bookingId: response.data?.id,
+      status: response.status,
+      serviceCount: serviceIds.length
+    });
+
+    return {
+      data: response.data,
+      payload: bookingPayload
+    };
+  } catch (error) {
+    if (error.response) {
+      console.error('[createBookingInZenoti] Zenoti API responded with error', {
+        status: error.response.status,
+        data: error.response.data
+      });
+    } else {
+      console.error('[createBookingInZenoti] Failed to create booking', {
+        message: error.message
+      });
+    }
+
+    console.error('[createBookingInZenoti] Payload that caused error', bookingPayload);
+    console.error('[createBookingInZenoti] Error response', error.response?.data || error.message);
+    throw error;
+  }
+};
+
+const reserveSlotInZenoti = async ({ bookingId, slotTime, createInvoice = false }) => {
+  if (!bookingId) {
+    throw new ApiValidationError('bookingId is required', 400);
+  }
+
+  if (!slotTime) {
+    throw new ApiValidationError('slot_time is required', 400);
+  }
+
+  const slotDate = new Date(slotTime);
+  if (Number.isNaN(slotDate.getTime())) {
+    throw new ApiValidationError('slot_time must be a valid date string', 400);
+  }
+
+  // Use the slot_time as-is without timezone conversion
+  // Zenoti expects the time in the center's local timezone
+  const formattedSlotTime = slotTime;
+
+  const reservePayload = {
+    slot_time: formattedSlotTime,
+    create_invoice: createInvoice
+  };
+
+  const { zenotiApiKey, zenotiBaseUrl } = getZenotiConfig();
+
+  console.log('[reserveSlotInZenoti] Request payload', {
+    bookingId,
+    reservePayload
+  });
+
+  try {
+    const response = await makeZenotiRequest(async () => {
+      return await axios.post(`${zenotiBaseUrl}/bookings/${bookingId}/slots/reserve`, reservePayload, {
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `apikey ${zenotiApiKey}`
+        }
+      });
+    });
+
+    console.log('[reserveSlotInZenoti] Reservation created', {
+      bookingId,
+      slot_time: formattedSlotTime,
+      status: response.status
+    });
+
+    return {
+      data: response.data,
+      payload: reservePayload,
+      formattedSlotTime
+    };
+  } catch (error) {
+    if (error.response) {
+      console.error('[reserveSlotInZenoti] Zenoti API responded with error', {
+        status: error.response.status,
+        data: error.response.data
+      });
+    } else {
+      console.error('[reserveSlotInZenoti] Failed to reserve slot', {
+        message: error.message
+      });
+    }
+
     throw error;
   }
 };
@@ -1034,12 +1333,16 @@ app.post('/api/slots/unified', async (req, res) => {
       now.getUTCMonth(),
       now.getUTCDate()
     ));
+    const currentWeekStartDateStr = weekDates[0]?.date;
+    const currentWeekStartDate = currentWeekStartDateStr
+      ? new Date(`${currentWeekStartDateStr}T00:00:00Z`)
+      : todayStartUTC;
     const maxDate = new Date(todayStartUTC.getTime() + (28 * 24 * 60 * 60 * 1000)); // 28 days from today (inclusive)
     
     // Filter dates to only include those within 28 days
     targetDates = targetDates.filter(dateStr => {
       const date = new Date(`${dateStr}T00:00:00Z`);
-      return date >= todayStartUTC && date <= maxDate;
+      return date >= currentWeekStartDate && date <= maxDate;
     });
     
     if (targetDates.length === 0) {
@@ -1657,64 +1960,102 @@ app.get('/api/categories', async (req, res) => {
 
 // Booking Management endpoints (Reserve, Confirm, Status, Cancel)
 
-// Reserve a specific slot
+// Create or update guest in Zenoti
+app.post('/api/guests', async (req, res) => {
+  try {
+    const { name, first_name: firstName, last_name: lastName, email, phone, provider_id: providerId } = req.body;
+
+    const result = await createGuestInZenoti({
+      centerId: providerId,
+      name,
+      firstName,
+      lastName,
+      email,
+      phone
+    });
+
+    console.log('[POST /api/guests] Guest created successfully', {
+      center_id: providerId,
+      email,
+      phone: result.sanitizedPhone
+    });
+
+    res.json({
+      success: true,
+      data: result.data,
+      message: 'Guest created successfully'
+    });
+  } catch (error) {
+    console.error('Error creating guest:', error.message);
+    if (error.response) {
+      console.error('Zenoti API response status:', error.response.status);
+      console.error('Zenoti API response data:', error.response.data);
+    }
+
+    const statusCode = error instanceof ApiValidationError ? error.statusCode : (error.response?.status || 500);
+
+    res.status(statusCode).json({
+      success: false,
+      error: error.message,
+      details: error.response?.data || error.details || null
+    });
+  }
+});
+
 app.post('/api/bookings/:bookingId/reserve', async (req, res) => {
   try {
     const { bookingId } = req.params;
-    const { slot_time } = req.body;
     
-    if (!slot_time) {
-      res.status(400).json({
-        success: false,
-        error: 'slot_time is required'
-      });
-      return;
-    }
+    // Debug logging
+    console.log('[DEBUG] Request headers:', req.headers);
+    console.log('[DEBUG] Request body:', req.body);
+    console.log('[DEBUG] Request query:', req.query);
+    console.log('[DEBUG] Request body type:', typeof req.body);
     
-    const zenotiApiKey = process.env.ZENOTI_API_KEY;
-    const zenotiBaseUrl = process.env.ZENOTI_BASE_URL || 'https://api.zenoti.com/v1';
-    
-    if (!zenotiApiKey) {
-      throw new Error('Zenoti API key not configured');
-    }
-    
-    // Format slot_time to ensure proper format
-    const formattedSlotTime = new Date(slot_time).toISOString();
-    
-    const reservePayload = {
-      slot_time: formattedSlotTime
-    };
-    
-    console.log(`Reserving slot for booking ${bookingId} at ${formattedSlotTime}`);
-    
-    const response = await makeZenotiRequest(async () => {
-      return await axios.post(`${zenotiBaseUrl}/bookings/${bookingId}/slots/reserve`, reservePayload, {
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `apikey ${zenotiApiKey}`
-        }
-      });
+    // Accept slot_time from either query params or body
+    const slotTime = req.query.slot_time || req.body.slot_time;
+    const createInvoice = req.query.create_invoice === 'true' || req.body.create_invoice || false;
+
+    const result = await reserveSlotInZenoti({
+      bookingId,
+      slotTime,
+      createInvoice
     });
-    
+
+    // Extract reservation_id from Zenoti response (it returns an array)
+    const reservationId = Array.isArray(result.data) && result.data.length > 0
+      ? result.data[0].reservation_id
+      : null;
+
+    console.log('[POST /api/bookings/:bookingId/reserve] Slot reserved', {
+      booking_id: bookingId,
+      reservation_id: reservationId,
+      slot_time: result.formattedSlotTime,
+      createInvoice
+    });
+
     res.json({
       success: true,
-      data: response.data,
+      data: result.data,
       message: `Slot reserved successfully for booking ${bookingId}`,
       booking_id: bookingId,
-      slot_time: formattedSlotTime
+      reservation_id: reservationId,
+      slot_time: result.formattedSlotTime
     });
-    
   } catch (error) {
     console.error(`Error reserving slot for booking ${req.params.bookingId}:`, error.message);
     if (error.response) {
       console.error('Zenoti API response status:', error.response.status);
       console.error('Zenoti API response data:', error.response.data);
     }
-    
-    res.status(500).json({
+
+    const statusCode = error instanceof ApiValidationError ? error.statusCode : (error.response?.status || 500);
+
+    res.status(statusCode).json({
       success: false,
       error: error.message,
-      booking_id: req.params.bookingId
+      booking_id: req.params.bookingId,
+      details: error.response?.data || error.details || null
     });
   }
 });
@@ -1764,7 +2105,7 @@ app.post('/api/bookings/:bookingId/confirm', async (req, res) => {
     console.log(`Confirming booking ${bookingId} for guest:`, confirmPayload.guest.first_name, confirmPayload.guest.last_name);
     
     const response = await makeZenotiRequest(async () => {
-      return await axios.post(`${zenotiBaseUrl}/bookings/${bookingId}/confirm`, confirmPayload, {
+      return await axios.post(`${zenotiBaseUrl}/bookings/${bookingId}/slots/confirm`, confirmPayload, {
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `apikey ${zenotiApiKey}`
@@ -1772,14 +2113,26 @@ app.post('/api/bookings/:bookingId/confirm', async (req, res) => {
       });
     });
     
+    // Extract relevant data from Zenoti response
+    const isConfirmed = response.data.is_confirmed || false;
+    const invoice = response.data.invoice || {};
+    const invoiceId = invoice.invoice_id || null;
+    const guestInfo = invoice.guest || null;
+    
+    // Extract appointment_id from first item if available
+    const items = invoice.items || [];
+    const appointmentId = items.length > 0 ? items[0].appointment_id : null;
+    
     res.json({
       success: true,
       data: response.data,
       message: `Booking ${bookingId} confirmed successfully`,
       booking_id: bookingId,
-      confirmation_number: response.data.confirmation_number,
-      appointment_id: response.data.appointment_id,
-      invoice_id: response.data.invoice_id
+      is_confirmed: isConfirmed,
+      invoice_id: invoiceId,
+      appointment_id: appointmentId,
+      guest: guestInfo,
+      items: items
     });
     
   } catch (error) {
@@ -1886,27 +2239,57 @@ app.delete('/api/bookings/:bookingId/reserve', async (req, res) => {
 // Select best provider for a specific slot with single booking ID (called when user clicks "next")
 app.post('/api/slots/select-provider', async (req, res) => {
   try {
-    const { slotTime, date, bookingId } = req.body;
+    const { slotTime, date, serviceIds, guest_id: guestId, dateAvailability } = req.body;
     
     // Debug logging
     console.log('🎯 Provider selection request received:', {
       slotTime,
       date,
-      bookingId,
+      serviceIds,
+      guestId,
+      providersOnDate: dateAvailability?.center_ids?.length || 0,
       timestamp: new Date().toISOString()
     });
     
-    if (!slotTime || !date || !bookingId) {
-      console.log('❌ Validation failed:', { slotTime, date, bookingId });
+    if (!slotTime || !date) {
+      console.log('❌ Validation failed:', { slotTime, date });
       res.status(400).json({
         success: false,
-        error: 'slotTime, date, and bookingId are required',
-        received: { slotTime, date, bookingId }
+        error: 'slotTime and date are required',
+        received: { slotTime, date }
       });
       return;
     }
     
-    // Get booking details from Zenoti API to extract center information
+    if (!Array.isArray(serviceIds) || serviceIds.length === 0) {
+      res.status(400).json({
+        success: false,
+        error: 'serviceIds must be a non-empty array',
+        received: { serviceIds }
+      });
+      return;
+    }
+    
+    if (!guestId) {
+      res.status(400).json({
+        success: false,
+        error: 'guest_id is required',
+        received: { guestId }
+      });
+      return;
+    }
+    
+    // Validate dateAvailability object
+    if (!dateAvailability || !Array.isArray(dateAvailability.center_ids) || dateAvailability.center_ids.length === 0) {
+      res.status(400).json({
+        success: false,
+        error: 'dateAvailability.center_ids array is required and must contain at least one provider',
+        received: { dateAvailability }
+      });
+      return;
+    }
+    
+    // Create a fresh booking for the provided slot and date
     const zenotiApiKey = process.env.ZENOTI_API_KEY;
     const zenotiBaseUrl = process.env.ZENOTI_BASE_URL || 'https://api.zenoti.com/v1';
     
@@ -1914,65 +2297,186 @@ app.post('/api/slots/select-provider', async (req, res) => {
       throw new Error('Zenoti API key not configured');
     }
     
-    let bookingData;
+    // Extract just the time part from slotTime (e.g., "2025-10-23T12:00:00" -> "12:00")
+    const timeOnly = slotTime.includes('T') ? slotTime.split('T')[1].substring(0, 5) : slotTime.substring(0, 5);
+    const hourKey = timeOnly.substring(0, 2) + ':00'; // Get hour bucket (e.g., "12:00")
+    
+    console.log('🔍 Filtering providers with slot time:', { slotTime, timeOnly, hourKey });
+    
+    // Filter providers to only those that have the specific slot time available
+    const providersWithSlot = dateAvailability.center_ids.filter(provider => {
+      // Check if provider has hourly_slots data
+      if (provider.hourly_slots && Array.isArray(provider.hourly_slots)) {
+        // Check if the hour bucket exists and has slots
+        const hasHourBucket = provider.hourly_slots.some(bucket => 
+          bucket.time === hourKey && bucket.available && (bucket.count || 0) > 0
+        );
+        
+        if (hasHourBucket) {
+          console.log(`✅ Provider ${provider.id} (priority ${provider.priority}) has slots in hour ${hourKey}`);
+          return true;
+        }
+      }
+      
+      // Also check individual slots if available
+      if (provider.slots && Array.isArray(provider.slots)) {
+        const hasExactSlot = provider.slots.some(slot => {
+          const slotTime = slot.time || slot.Time;
+          if (!slotTime) return false;
+          
+          // Extract time from slot (handle both "HH:MM" and full datetime formats)
+          const slotTimeOnly = slotTime.includes('T') ? slotTime.split('T')[1].substring(0, 5) : slotTime.substring(0, 5);
+          return slotTimeOnly === timeOnly;
+        });
+        
+        if (hasExactSlot) {
+          console.log(`✅ Provider ${provider.id} (priority ${provider.priority}) has exact slot at ${timeOnly}`);
+          return true;
+        }
+      }
+      
+      console.log(`❌ Provider ${provider.id} (priority ${provider.priority}) does not have slot at ${timeOnly}`);
+      return false;
+    });
+    
+    console.log(`📊 Filtered to ${providersWithSlot.length} providers with availability at ${slotTime}`);
+    
+    if (providersWithSlot.length === 0) {
+      res.status(404).json({
+        success: false,
+        error: `No providers have availability at slot time ${slotTime}`,
+        slotTime,
+        date,
+        totalProvidersOnDate: dateAvailability.center_ids.length
+      });
+      return;
+    }
+    
+    // Sort by priority (lowest number = highest priority) and select the best one
+    const sortedProviders = providersWithSlot
+      .filter(p => p.priority != null)
+      .sort((a, b) => a.priority - b.priority);
+    
+    console.log('📊 Providers with slot (sorted by priority):', sortedProviders.map(p => ({
+      id: p.id,
+      priority: p.priority,
+      booking_id: p.booking_id
+    })));
+    
+    if (sortedProviders.length === 0) {
+      res.status(400).json({
+        success: false,
+        error: 'No providers with valid priority found',
+        slotTime,
+        date
+      });
+      return;
+    }
+    
+    const selectedProvider = sortedProviders[0];
+      
+    if (!selectedProvider) {
+      res.status(404).json({
+        success: false,
+        error: 'No providers available for slot selection',
+        slotTime,
+        date
+      });
+      return;
+    }
+    
+    const centerId = selectedProvider.id;
+    
+    // Get full provider details from static data
+    const provider = getProviderById(centerId);
+    
+    if (!provider) {
+      res.status(404).json({
+        success: false,
+        error: `Provider not found for center ID: ${centerId}`,
+        slotTime,
+        date
+      });
+      return;
+    }
+    
+    console.log('✅ Selected provider:', {
+      centerId,
+      name: provider.name,
+      priority: selectedProvider.priority,
+      totalAvailable: sortedProviders.length
+    });
+    
+    // Format date to YYYY-MM-DD
+    const formattedDate = new Date(date).toISOString().split('T')[0];
+    
+    // Generate a NEW booking through Zenoti (not reusing any existing booking ID)
+    let bookingId;
     try {
-      const response = await makeZenotiRequest(async () => {
-        return await axios.get(`${zenotiBaseUrl}/bookings/${bookingId}`, {
+      const bookingPayload = {
+        center_id: centerId,
+        date: formattedDate,
+        guests: [
+          {
+            id: guestId, // Use the provided guest_id
+            items: serviceIds.map(serviceId => ({
+              item: { id: serviceId }
+            }))
+          }
+        ]
+      };
+      
+      console.log('🎯 Creating NEW booking with payload:', JSON.stringify(bookingPayload, null, 2));
+      
+      const bookingResponse = await makeZenotiRequest(async () => {
+        return await axios.post(`${zenotiBaseUrl}/bookings?is_double_booking_enabled=false`, bookingPayload, {
           headers: {
             'Content-Type': 'application/json',
             'Authorization': `apikey ${zenotiApiKey}`
           }
         });
       });
-      bookingData = response.data;
-    } catch (error) {
-      console.error(`Failed to fetch booking ${bookingId}:`, error.message);
-      res.status(404).json({
-        success: false,
-        error: 'Booking not found or invalid booking ID',
+      
+      bookingId = bookingResponse.data?.id;
+      
+      console.log('✅ Booking created successfully:', {
         bookingId,
-        slotTime,
-        date
-      });
-      return;
-    }
-    
-    // Extract center ID from booking data
-    const centerId = bookingData.center_id;
-    if (!centerId) {
-      console.log('❌ No center_id found in booking data:', bookingData);
-      res.status(400).json({
-        success: false,
-        error: 'Invalid booking data - no center information found',
-        bookingId,
-        slotTime,
-        date
-      });
-      return;
-    }
-    
-    // Get provider information
-    const provider = getProviderById(centerId);
-    
-    if (!provider) {
-      console.log('❌ Provider not found for centerId:', centerId);
-      res.status(404).json({
-        success: false,
-        error: 'Provider not found for the given centerId',
         centerId,
-        bookingId,
+        date: formattedDate
+      });
+    } catch (error) {
+      console.error(`❌ Failed to create booking for center ${centerId}:`, error.message);
+      if (error.response) {
+        console.error('Zenoti API response status:', error.response.status);
+        console.error('Zenoti API response data:', error.response.data);
+      }
+      res.status(500).json({
+        success: false,
+        error: 'Failed to generate booking ID',
+        details: error.response?.data || error.message,
         slotTime,
         date
       });
       return;
     }
     
-    // Log the selection for analytics
+    if (!bookingId) {
+      res.status(500).json({
+        success: false,
+        error: 'Booking ID not returned from Zenoti',
+        slotTime,
+        date
+      });
+      return;
+    }
+    
+    // Log the selection and booking creation for analytics
     console.log(`🎯 Provider selected for slot ${slotTime} on ${date}:`, {
       provider: provider.name,
-      priority: provider.priority,
-      bookingId: bookingId,
-      centerId: centerId,
+      priority: selectedProvider.priority,
+      bookingId,
+      guestId,
+      centerId,
       timestamp: new Date().toISOString()
     });
     
@@ -1982,16 +2486,19 @@ app.post('/api/slots/select-provider', async (req, res) => {
         selectedProvider: {
           centerId: centerId,
           centerName: provider.name,
-          priority: provider.priority,
-          bookingId: bookingId,
+          priority: selectedProvider.priority,
+          bookingId,
+          guestId,
           isFallback: false,
-          totalOptions: 1
+          totalOptions: sortedProviders.length
         },
         slotTime,
         date,
-        selectionReason: 'single_provider'
+        selectionReason: 'highest_priority'
       },
-      message: `Provider selected for slot ${slotTime} with booking ID: ${bookingId}`,
+      message: `Provider ${provider.name} (priority ${selectedProvider.priority}) selected for slot ${slotTime} with new booking ID: ${bookingId}`,
+      booking_id: bookingId,
+      guest_id: guestId,
       slotTime,
       date
     });
@@ -2065,6 +2572,7 @@ app.use((req, res) => {
       'GET /api/bookings/:bookingId/slots?check_future_day_availability=true',
       'POST /api/slots/unified',
       'POST /api/slots/select-provider',
+      'POST /api/guests',
       'GET /api/slots/test-provider-selection',
       'GET /api/slots/test-week-dates',
       'POST /api/bookings/:bookingId/reserve',
@@ -2079,12 +2587,6 @@ app.use((req, res) => {
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`🚀 Zenoti API Layer running on port ${PORT}`);
-  console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`⚡ Rate Limiting: ${rateLimitTracker.maxCallsPerMinute} calls/minute with retry logic`);
-  console.log(`💾 Caching: ${CACHE_TTL/1000}s TTL enabled`);
-  console.log(`🕐 Slot Aggregation: 15-min slots → 1-hour buckets (75% reduction, optimized response)`);
-  console.log(`📅 Date Range: Limited to 28 days (4 weeks) from current date`);
   console.log(`📋 Available endpoints:`);
   console.log(`   - GET /api/providers`);
   console.log(`   - GET /api/providers/zipcode/:zipcode`);
@@ -2097,14 +2599,12 @@ app.listen(PORT, () => {
   console.log(`   - GET /api/bookings/:bookingId/slots (with future day availability)`);
   console.log(`   - POST /api/slots/unified (with hourly aggregation and week-based selection)`);
   console.log(`   - POST /api/slots/select-provider (priority-based selection with booking IDs)`);
+  console.log(`   - POST /api/guests`);
   console.log(`   - POST /api/bookings/:bookingId/reserve`);
   console.log(`   - POST /api/bookings/:bookingId/confirm`);
   console.log(`   - GET /api/bookings/:bookingId/status`);
   console.log(`   - DELETE /api/bookings/:bookingId/reserve`);
   console.log(`   - GET /api/rate-limit/status`);
-  console.log(`\n🎯 Test with: curl http://localhost:${PORT}/api/providers/zipcode/48236`);
-  console.log(`📊 Rate limit status: curl http://localhost:${PORT}/api/rate-limit/status`);
-  console.log(`🕐 Slots: Frontend can use both 'hourly_slots' (optimized) and 'individual_slots' (detailed)`);
 });
 
 export default app;
