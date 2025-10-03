@@ -2064,15 +2064,25 @@ app.post('/api/bookings/:bookingId/reserve', async (req, res) => {
 app.post('/api/bookings/:bookingId/confirm', async (req, res) => {
   try {
     const { bookingId } = req.params;
-    const { guest, payment_method, notes } = req.body;
     
-    if (!guest) {
+    // Debug logging
+    console.log('[DEBUG /api/bookings/:bookingId/confirm] Request headers:', req.headers);
+    console.log('[DEBUG /api/bookings/:bookingId/confirm] Request body:', req.body);
+    console.log('[DEBUG /api/bookings/:bookingId/confirm] Request body type:', typeof req.body);
+    
+    // Check if req.body exists
+    if (!req.body || typeof req.body !== 'object') {
       res.status(400).json({
         success: false,
-        error: 'guest information is required'
+        error: 'Request body is missing or invalid. Please ensure Content-Type is set to application/json',
+        booking_id: bookingId,
+        received_body: req.body,
+        received_content_type: req.headers['content-type']
       });
       return;
     }
+    
+    const { notes, group_name } = req.body;
     
     const zenotiApiKey = process.env.ZENOTI_API_KEY;
     const zenotiBaseUrl = process.env.ZENOTI_BASE_URL || 'https://api.zenoti.com/v1';
@@ -2081,28 +2091,18 @@ app.post('/api/bookings/:bookingId/confirm', async (req, res) => {
       throw new Error('Zenoti API key not configured');
     }
     
-    const confirmPayload = {
-      guest: {
-        id: guest.id || null,
-        first_name: guest.first_name || guest.firstName,
-        last_name: guest.last_name || guest.lastName,
-        email: guest.email,
-        phone: guest.phone,
-        date_of_birth: guest.date_of_birth || guest.dateOfBirth,
-        gender: guest.gender,
-        address: guest.address ? {
-          street: guest.address.street,
-          city: guest.address.city,
-          state: guest.address.state,
-          zip_code: guest.address.zip_code || guest.address.zipCode,
-          country: guest.address.country || 'US'
-        } : undefined
-      },
-      payment_method: payment_method || 'credit_card',
-      notes: notes || ''
-    };
+    // According to Zenoti docs, confirm endpoint only accepts notes and group_name (both optional)
+    const confirmPayload = {};
     
-    console.log(`Confirming booking ${bookingId} for guest:`, confirmPayload.guest.first_name, confirmPayload.guest.last_name);
+    if (notes) {
+      confirmPayload.notes = notes;
+    }
+    
+    if (group_name) {
+      confirmPayload.group_name = group_name;
+    }
+    
+    console.log(`Confirming booking ${bookingId} with payload:`, confirmPayload);
     
     const response = await makeZenotiRequest(async () => {
       return await axios.post(`${zenotiBaseUrl}/bookings/${bookingId}/slots/confirm`, confirmPayload, {
@@ -2142,10 +2142,13 @@ app.post('/api/bookings/:bookingId/confirm', async (req, res) => {
       console.error('Zenoti API response data:', error.response.data);
     }
     
-    res.status(500).json({
+    const statusCode = error.response?.status || 500;
+    
+    res.status(statusCode).json({
       success: false,
       error: error.message,
-      booking_id: req.params.bookingId
+      booking_id: req.params.bookingId,
+      details: error.response?.data || null
     });
   }
 });
