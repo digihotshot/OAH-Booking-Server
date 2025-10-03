@@ -2236,55 +2236,52 @@ app.delete('/api/bookings/:bookingId/reserve', async (req, res) => {
   }
 });
 
-// Select best provider for a specific slot with single booking ID (called when user clicks "next")
+// Select provider and create booking
 app.post('/api/slots/select-provider', async (req, res) => {
   try {
-    const { slotTime, date, serviceIds, guest_id: guestId, dateAvailability } = req.body;
+    const { center_id, guest_id, service_ids, date } = req.body;
     
     // Debug logging
     console.log('🎯 Provider selection request received:', {
-      slotTime,
+      center_id,
+      guest_id,
+      service_ids,
       date,
-      serviceIds,
-      guestId,
-      providersOnDate: dateAvailability?.center_ids?.length || 0,
       timestamp: new Date().toISOString()
     });
     
-    if (!slotTime || !date) {
-      console.log('❌ Validation failed:', { slotTime, date });
+    if (!center_id) {
       res.status(400).json({
         success: false,
-        error: 'slotTime and date are required',
-        received: { slotTime, date }
+        error: 'center_id is required',
+        received: { center_id }
       });
       return;
     }
     
-    if (!Array.isArray(serviceIds) || serviceIds.length === 0) {
-      res.status(400).json({
-        success: false,
-        error: 'serviceIds must be a non-empty array',
-        received: { serviceIds }
-      });
-      return;
-    }
-    
-    if (!guestId) {
+    if (!guest_id) {
       res.status(400).json({
         success: false,
         error: 'guest_id is required',
-        received: { guestId }
+        received: { guest_id }
       });
       return;
     }
     
-    // Validate dateAvailability object
-    if (!dateAvailability || !Array.isArray(dateAvailability.center_ids) || dateAvailability.center_ids.length === 0) {
+    if (!Array.isArray(service_ids) || service_ids.length === 0) {
       res.status(400).json({
         success: false,
-        error: 'dateAvailability.center_ids array is required and must contain at least one provider',
-        received: { dateAvailability }
+        error: 'service_ids must be a non-empty array',
+        received: { service_ids }
+      });
+      return;
+    }
+    
+    if (!date) {
+      res.status(400).json({
+        success: false,
+        error: 'date is required',
+        received: { date }
       });
       return;
     }
@@ -2297,136 +2294,43 @@ app.post('/api/slots/select-provider', async (req, res) => {
       throw new Error('Zenoti API key not configured');
     }
     
-    // Extract just the time part from slotTime (e.g., "2025-10-23T12:00:00" -> "12:00")
-    const timeOnly = slotTime.includes('T') ? slotTime.split('T')[1].substring(0, 5) : slotTime.substring(0, 5);
-    const hourKey = timeOnly.substring(0, 2) + ':00'; // Get hour bucket (e.g., "12:00")
-    
-    console.log('🔍 Filtering providers with slot time:', { slotTime, timeOnly, hourKey });
-    
-    // Filter providers to only those that have the specific slot time available
-    const providersWithSlot = dateAvailability.center_ids.filter(provider => {
-      // Check if provider has hourly_slots data
-      if (provider.hourly_slots && Array.isArray(provider.hourly_slots)) {
-        // Check if the hour bucket exists and has slots
-        const hasHourBucket = provider.hourly_slots.some(bucket => 
-          bucket.time === hourKey && bucket.available && (bucket.count || 0) > 0
-        );
-        
-        if (hasHourBucket) {
-          console.log(`✅ Provider ${provider.id} (priority ${provider.priority}) has slots in hour ${hourKey}`);
-          return true;
-        }
-      }
-      
-      // Also check individual slots if available
-      if (provider.slots && Array.isArray(provider.slots)) {
-        const hasExactSlot = provider.slots.some(slot => {
-          const slotTime = slot.time || slot.Time;
-          if (!slotTime) return false;
-          
-          // Extract time from slot (handle both "HH:MM" and full datetime formats)
-          const slotTimeOnly = slotTime.includes('T') ? slotTime.split('T')[1].substring(0, 5) : slotTime.substring(0, 5);
-          return slotTimeOnly === timeOnly;
-        });
-        
-        if (hasExactSlot) {
-          console.log(`✅ Provider ${provider.id} (priority ${provider.priority}) has exact slot at ${timeOnly}`);
-          return true;
-        }
-      }
-      
-      console.log(`❌ Provider ${provider.id} (priority ${provider.priority}) does not have slot at ${timeOnly}`);
-      return false;
-    });
-    
-    console.log(`📊 Filtered to ${providersWithSlot.length} providers with availability at ${slotTime}`);
-    
-    if (providersWithSlot.length === 0) {
-      res.status(404).json({
-        success: false,
-        error: `No providers have availability at slot time ${slotTime}`,
-        slotTime,
-        date,
-        totalProvidersOnDate: dateAvailability.center_ids.length
-      });
-      return;
-    }
-    
-    // Sort by priority (lowest number = highest priority) and select the best one
-    const sortedProviders = providersWithSlot
-      .filter(p => p.priority != null)
-      .sort((a, b) => a.priority - b.priority);
-    
-    console.log('📊 Providers with slot (sorted by priority):', sortedProviders.map(p => ({
-      id: p.id,
-      priority: p.priority,
-      booking_id: p.booking_id
-    })));
-    
-    if (sortedProviders.length === 0) {
-      res.status(400).json({
-        success: false,
-        error: 'No providers with valid priority found',
-        slotTime,
-        date
-      });
-      return;
-    }
-    
-    const selectedProvider = sortedProviders[0];
-      
-    if (!selectedProvider) {
-      res.status(404).json({
-        success: false,
-        error: 'No providers available for slot selection',
-        slotTime,
-        date
-      });
-      return;
-    }
-    
-    const centerId = selectedProvider.id;
-    
     // Get full provider details from static data
-    const provider = getProviderById(centerId);
+    const provider = getProviderById(center_id);
     
     if (!provider) {
       res.status(404).json({
         success: false,
-        error: `Provider not found for center ID: ${centerId}`,
-        slotTime,
-        date
+        error: `Provider not found for center ID: ${center_id}`,
+        center_id
       });
       return;
     }
     
     console.log('✅ Selected provider:', {
-      centerId,
-      name: provider.name,
-      priority: selectedProvider.priority,
-      totalAvailable: sortedProviders.length
+      center_id,
+      name: provider.name
     });
     
     // Format date to YYYY-MM-DD
     const formattedDate = new Date(date).toISOString().split('T')[0];
     
-    // Generate a NEW booking through Zenoti (not reusing any existing booking ID)
+    // Generate a NEW booking through Zenoti
     let bookingId;
     try {
       const bookingPayload = {
-        center_id: centerId,
+        center_id: center_id,
         date: formattedDate,
         guests: [
           {
-            id: guestId, // Use the provided guest_id
-            items: serviceIds.map(serviceId => ({
+            id: guest_id,
+            items: service_ids.map(serviceId => ({
               item: { id: serviceId }
             }))
           }
         ]
       };
       
-      console.log('🎯 Creating NEW booking with payload:', JSON.stringify(bookingPayload, null, 2));
+      console.log('🎯 Creating booking with payload:', JSON.stringify(bookingPayload, null, 2));
       
       const bookingResponse = await makeZenotiRequest(async () => {
         return await axios.post(`${zenotiBaseUrl}/bookings?is_double_booking_enabled=false`, bookingPayload, {
@@ -2441,11 +2345,11 @@ app.post('/api/slots/select-provider', async (req, res) => {
       
       console.log('✅ Booking created successfully:', {
         bookingId,
-        centerId,
+        center_id,
         date: formattedDate
       });
     } catch (error) {
-      console.error(`❌ Failed to create booking for center ${centerId}:`, error.message);
+      console.error(`❌ Failed to create booking for center ${center_id}:`, error.message);
       if (error.response) {
         console.error('Zenoti API response status:', error.response.status);
         console.error('Zenoti API response data:', error.response.data);
@@ -2454,8 +2358,8 @@ app.post('/api/slots/select-provider', async (req, res) => {
         success: false,
         error: 'Failed to generate booking ID',
         details: error.response?.data || error.message,
-        slotTime,
-        date
+        center_id,
+        date: formattedDate
       });
       return;
     }
@@ -2464,52 +2368,41 @@ app.post('/api/slots/select-provider', async (req, res) => {
       res.status(500).json({
         success: false,
         error: 'Booking ID not returned from Zenoti',
-        slotTime,
-        date
+        center_id,
+        date: formattedDate
       });
       return;
     }
     
     // Log the selection and booking creation for analytics
-    console.log(`🎯 Provider selected for slot ${slotTime} on ${date}:`, {
+    console.log(`🎯 Provider selected and booking created:`, {
       provider: provider.name,
-      priority: selectedProvider.priority,
       bookingId,
-      guestId,
-      centerId,
+      guest_id,
+      center_id,
       timestamp: new Date().toISOString()
     });
     
     res.json({
       success: true,
       data: {
-        selectedProvider: {
-          centerId: centerId,
-          centerName: provider.name,
-          priority: selectedProvider.priority,
-          bookingId,
-          guestId,
-          isFallback: false,
-          totalOptions: sortedProviders.length
-        },
-        slotTime,
-        date,
-        selectionReason: 'highest_priority'
+        center_id,
+        center_name: provider.name,
+        booking_id: bookingId,
+        guest_id,
+        date: formattedDate
       },
-      message: `Provider ${provider.name} (priority ${selectedProvider.priority}) selected for slot ${slotTime} with new booking ID: ${bookingId}`,
-      booking_id: bookingId,
-      guest_id: guestId,
-      slotTime,
-      date
+      message: `Provider ${provider.name} selected with booking ID: ${bookingId}`
     });
     
   } catch (error) {
-    console.error(`Error selecting provider for slot:`, error.message);
+    console.error(`Error selecting provider:`, error.message);
     
     res.status(500).json({
       success: false,
       error: error.message,
-      slotTime: req.body.slotTime,
+      center_id: req.body.center_id,
+      guest_id: req.body.guest_id,
       date: req.body.date
     });
   }
@@ -2571,7 +2464,7 @@ app.use((req, res) => {
       'POST /api/bookings (single or multiple centers)',
       'GET /api/bookings/:bookingId/slots?check_future_day_availability=true',
       'POST /api/slots/unified',
-      'POST /api/slots/select-provider',
+      'POST /api/slots/select-provider (first available)',
       'POST /api/guests',
       'GET /api/slots/test-provider-selection',
       'GET /api/slots/test-week-dates',
@@ -2598,7 +2491,7 @@ app.listen(PORT, () => {
   console.log(`   - POST /api/bookings (single or multiple centers)`);
   console.log(`   - GET /api/bookings/:bookingId/slots (with future day availability)`);
   console.log(`   - POST /api/slots/unified (with hourly aggregation and week-based selection)`);
-  console.log(`   - POST /api/slots/select-provider (priority-based selection with booking IDs)`);
+  console.log(`   - POST /api/slots/select-provider`);
   console.log(`   - POST /api/guests`);
   console.log(`   - POST /api/bookings/:bookingId/reserve`);
   console.log(`   - POST /api/bookings/:bookingId/confirm`);
