@@ -249,6 +249,49 @@ const resolveGuestNames = ({ name, firstName, lastName }) => {
   };
 };
 
+const searchGuestInZenoti = async ({ phone, email }) => {
+  const normalizedPhone = phone ? String(phone).trim() : '';
+  const normalizedEmail = email ? String(email).trim() : '';
+
+  if (!normalizedPhone && !normalizedEmail) {
+    throw new ApiValidationError('phone or email is required', 400);
+  }
+
+  let sanitizedPhoneForZenoti = null;
+  if (normalizedPhone) {
+    const sanitizedPhone = sanitizePhoneForZenoti(normalizedPhone);
+    sanitizedPhoneForZenoti = sanitizedPhone.zenoti;
+  }
+
+  const { zenotiApiKey, zenotiBaseUrl } = getZenotiConfig();
+
+  const queryParams = {
+    center_id: 'null',
+    email: normalizedEmail || undefined,
+    phone: sanitizedPhoneForZenoti || undefined
+  };
+
+  const response = await makeZenotiRequest(async () => {
+    return await axios.get(`${zenotiBaseUrl}/guests/search`, {
+      params: queryParams,
+      headers: {
+        'Authorization': `apikey ${zenotiApiKey}`
+      }
+    });
+  });
+
+  console.log('[Zenoti] Guest search executed', {
+    center_id: 'null',
+    email: normalizedEmail || null,
+    phone: sanitizedPhoneForZenoti || null
+  });
+
+  return {
+    data: response.data,
+    params: queryParams
+  };
+};
+
 const createGuestInZenoti = async ({ centerId, name, firstName, lastName, email, phone }) => {
   if (!centerId) {
     throw new ApiValidationError('center_id (provider_id) is required', 400);
@@ -475,31 +518,79 @@ const reserveSlotInZenoti = async ({ bookingId, slotTime, createInvoice = false 
 };
 
 // Zenoti API helper functions
-const fetchZenotiServices = async (centerId, categoryId = null) => {
+const fetchZenotiServices = async (centerId, categoryId = null, { pageSize = 10, maxPages = 100 } = {}) => {
   const zenotiApiKey = process.env.ZENOTI_API_KEY;
   const zenotiBaseUrl = process.env.ZENOTI_BASE_URL || 'https://api.zenoti.com';
-  
+
   if (!zenotiApiKey) {
     throw new Error('Zenoti API key not configured');
   }
-  
-  let url = `${zenotiBaseUrl}/centers/${centerId}/services?catalog_enabled=true`;
-  if (categoryId) {
-    url += `&category_id=${categoryId}`;
-  }
-  
+
+  const aggregatedServices = [];
+  const aggregatedAddOns = new Map();
+  let page = 1;
+  let pagesFetched = 0;
+
   try {
-    const response = await makeZenotiRequest(async () => {
-      return await axios.get(url, {
-        headers: {
-          'Authorization': `apikey ${zenotiApiKey}`,
-          'Accept': 'application/json',
-          'Content-Type': 'application/json'
+    while (pagesFetched < maxPages) {
+      const query = new URLSearchParams({
+        catalog_enabled: 'true',
+        page: String(page),
+        size: String(pageSize),
+        expand: 'add_ons_info'
+      });
+
+      if (categoryId) {
+        query.append('category_id', categoryId);
+      }
+
+      const url = `${zenotiBaseUrl}/centers/${centerId}/services?${query.toString()}`;
+
+      const response = await makeZenotiRequest(async () => {
+        return await axios.get(url, {
+          headers: {
+            'Authorization': `apikey ${zenotiApiKey}`,
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+          }
+        });
+      });
+
+      const services = Array.isArray(response.data?.services) ? response.data.services : [];
+
+      services.forEach(service => {
+        const isAddOn = service?.add_ons_info?.is_add_on === true;
+        if (isAddOn) {
+          if (service?.id) {
+            const existingAddOn = aggregatedAddOns.get(service.id);
+            if (existingAddOn) {
+              aggregatedAddOns.set(service.id, { ...existingAddOn, ...service });
+            } else {
+              aggregatedAddOns.set(service.id, service);
+            }
+          }
+        } else {
+          aggregatedServices.push(service);
         }
       });
-    });
-    
-    return response.data;
+
+      pagesFetched += 1;
+
+      if (services.length < pageSize) {
+        break;
+      }
+
+      page += 1;
+    }
+    return {
+      services: aggregatedServices,
+      addOns: Array.from(aggregatedAddOns.values()),
+      pagination: {
+        pages_fetched: pagesFetched,
+        page_size: pageSize,
+        total_fetched: aggregatedServices.length
+      }
+    };
   } catch (error) {
     console.error(`Zenoti API error for center ${centerId}:`, error.message);
     throw new Error(`Failed to fetch services from Zenoti API: ${error.message}`);
@@ -535,7 +626,72 @@ const fetchZenotiCategories = async (centerId) => {
 const aggregateCategoriesWithServicesFromAllCenters = async (centerIds) => {
   const allCategories = [];
   const categoryMap = new Map(); // To deduplicate categories across centers
-  const serviceMap = new Map(); // To deduplicate services across centers
+  const addOnMap = new Map(); // To aggregate add-on details by ID
+
+  const mapAddOnsForService = (addOnIds) => {
+    const uniqueIds = Array.isArray(addOnIds)
+      ? Array.from(new Set(addOnIds.filter(id => {
+          const type = typeof id;
+          return type === 'string' || type === 'number';
+        })))
+      : [];
+
+    const addOns = uniqueIds
+      .map(id => addOnMap.get(id.toLowerCase()))
+      .filter(addOn => Boolean(addOn));
+
+    return addOns.sort((a, b) => {
+      const nameA = a?.name || '';
+      const nameB = b?.name || '';
+      return nameA.localeCompare(nameB);
+    });
+  };
+
+  const upsertAddOn = (addOn, centerId) => {
+    if (!addOn?.id) {
+      return;
+    }
+
+    const price = addOn.price_info?.final_price ?? addOn.price_info?.sale_price ?? 0;
+    const existing = addOnMap.get(addOn.id.toLowerCase());
+
+    if (existing) {
+      if (centerId && !existing.available_centers.includes(centerId)) {
+        existing.available_centers.push(centerId);
+      }
+
+      if (centerId) {
+        if (!Array.isArray(existing.pricing)) {
+          existing.pricing = [];
+        }
+
+        const priceEntry = existing.pricing.find(entry => entry.center_id === centerId);
+        if (priceEntry) {
+          priceEntry.price = price;
+        } else {
+          existing.pricing.push({ center_id: centerId, price });
+        }
+      }
+
+      if (typeof price === 'number' && (!existing.price || price < existing.price)) {
+        existing.price = price;
+      }
+
+      addOnMap.set(addOn.id.toLowerCase(), existing);
+      return;
+    }
+
+    addOnMap.set(addOn.id.toLowerCase(), {
+      id: addOn.id,
+      name: addOn.name,
+      description: addOn.description,
+      duration: addOn.duration,
+      price,
+      code: addOn.code,
+      available_centers: centerId ? [centerId] : [],
+      pricing: centerId ? [{ center_id: centerId, price }] : []
+    });
+  };
   
   // First, fetch categories from all centers
   const centerPromises = centerIds.map(async (centerId) => {
@@ -584,18 +740,22 @@ const aggregateCategoriesWithServicesFromAllCenters = async (centerIds) => {
   const servicePromises = [];
   centerIds.forEach(centerId => {
     allCategories.forEach(category => {
-      const promise = fetchZenotiServices(centerId, category.id)
-        .then(servicesData => ({
+      const promise = fetchZenotiServices(centerId, category.id, { pageSize: 10 })
+        .then(result => ({
           centerId,
           categoryId: category.id,
-          services: servicesData.services || []
+          services: Array.isArray(result?.services) ? result.services : [],
+          addOns: Array.isArray(result?.addOns) ? result.addOns : [],
+          pagination: result?.pagination || null
         }))
         .catch(error => {
           console.error(`Failed to fetch services for center ${centerId}, category ${category.id}:`, error.message);
           return {
             centerId,
             categoryId: category.id,
-            services: []
+            services: [],
+            addOns: [],
+            pagination: null
           };
         });
       
@@ -606,8 +766,15 @@ const aggregateCategoriesWithServicesFromAllCenters = async (centerIds) => {
   // Wait for all service requests to complete
   const serviceResults = await Promise.all(servicePromises);
   
-  // Process services and group them under categories
-  serviceResults.forEach(({ centerId, categoryId, services }) => {
+  // First pass: Process all add-ons and store them in the map
+  serviceResults.forEach(({ centerId, categoryId, services, addOns }) => {
+    if (Array.isArray(addOns) && addOns.length > 0) {
+      addOns.forEach(addOn => upsertAddOn(addOn, centerId));
+    }
+  });
+
+  // Second pass: Process services and group them under categories
+  serviceResults.forEach(({ centerId, categoryId, services, addOns }) => {
     const category = categoryMap.get(categoryId);
     if (category) {
       services.forEach(service => {
@@ -624,7 +791,10 @@ const aggregateCategoriesWithServicesFromAllCenters = async (centerIds) => {
             duration: service.duration,
             price: service.price_info?.final_price || service.price_info?.sale_price || 0,
             code: service.code,
-            available_centers: [centerId]
+            available_centers: [centerId],
+            add_ons_list: service.add_ons_info?.add_ons_list || [],
+            add_ons: mapAddOnsForService(service.add_ons_info?.add_ons_list),
+            has_add_ons: service.add_ons_info?.has_add_ons || false
           };
           
           category.services.push(serviceData);
@@ -632,6 +802,14 @@ const aggregateCategoriesWithServicesFromAllCenters = async (centerIds) => {
           // Add center to existing service's available_centers
           if (!existingService.available_centers.includes(centerId)) {
             existingService.available_centers.push(centerId);
+          }
+          const newAddOnIds = Array.isArray(service.add_ons_info?.add_ons_list) ? service.add_ons_info.add_ons_list : [];
+          const existingIds = Array.isArray(existingService.add_ons_list) ? existingService.add_ons_list : [];
+          const mergedIds = Array.from(new Set([...existingIds, ...newAddOnIds]));
+          existingService.add_ons_list = mergedIds;
+          existingService.add_ons = mapAddOnsForService(mergedIds);
+          if (service.add_ons_info?.has_add_ons) {
+            existingService.has_add_ons = true;
           }
         }
       });
@@ -1905,7 +2083,7 @@ app.post('/api/slots/unified', async (req, res) => {
 app.get('/api/categories', async (req, res) => {
   try {
     // Get center IDs from query params
-    const { centerIds } = req.query;
+    const { centerIds, includeAddOns } = req.query;
     if (!centerIds) {
       res.status(400).json({
         success: false,
@@ -1915,6 +2093,7 @@ app.get('/api/categories', async (req, res) => {
     }
     
     const centers = centerIds.split(',');
+    const shouldIncludeAddOns = includeAddOns === 'true';
     
     const aggregatedData = await aggregateCategoriesWithServicesFromAllCenters(centers);
     const categories = aggregatedData.categories;
@@ -1929,12 +2108,38 @@ app.get('/api/categories', async (req, res) => {
       html_description: category.html_description,
       show_in_catalog: category.show_in_catalog,
       available_centers: category.available_centers,
-      services: category.services || []
+      services: (category.services || []).map(service => {
+        const serviceResponse = {
+          id: service.id,
+          name: service.name,
+          description: service.description,
+          duration: service.duration,
+          price: service.price,
+          code: service.code,
+          available_centers: service.available_centers,
+          has_add_ons: service.has_add_ons,
+          add_ons_list: service.add_ons_list || []
+        };
+        
+        // Include full add-ons details if requested or if add-ons exist
+        if (shouldIncludeAddOns || service.add_ons?.length > 0) {
+          serviceResponse.add_ons = service.add_ons || [];
+        }
+        
+        return serviceResponse;
+      })
     }));
     
     // Calculate total services across all categories
     const totalServices = categoriesResponse.reduce((total, category) => {
       return total + (category.services ? category.services.length : 0);
+    }, 0);
+    
+    // Calculate total add-ons across all services
+    const totalAddOns = categoriesResponse.reduce((total, category) => {
+      return total + (category.services || []).reduce((serviceTotal, service) => {
+        return serviceTotal + (service.add_ons?.length || 0);
+      }, 0);
     }, 0);
     
     res.json({
@@ -1943,9 +2148,11 @@ app.get('/api/categories', async (req, res) => {
         categories: categoriesResponse,
         total_categories: categoriesResponse.length,
         total_services: totalServices,
-        centers: centers
+        total_add_ons: totalAddOns,
+        centers: centers,
+        include_add_ons: shouldIncludeAddOns
       },
-      message: `Found ${categoriesResponse.length} categories with ${totalServices} services across ${centers.length} centers`
+      message: `Found ${categoriesResponse.length} categories with ${totalServices} services and ${totalAddOns} add-ons across ${centers.length} centers`
     });
     
   } catch (error) {
@@ -1987,6 +2194,44 @@ app.post('/api/guests', async (req, res) => {
     });
   } catch (error) {
     console.error('Error creating guest:', error.message);
+    if (error.response) {
+      console.error('Zenoti API response status:', error.response.status);
+      console.error('Zenoti API response data:', error.response.data);
+    }
+
+    const statusCode = error instanceof ApiValidationError ? error.statusCode : (error.response?.status || 500);
+
+    res.status(statusCode).json({
+      success: false,
+      error: error.message,
+      details: error.response?.data || error.details || null
+    });
+  }
+});
+
+app.get('/api/search-guest', async (req, res) => {
+  try {
+    const { data } = await searchGuestInZenoti({
+      phone: req.query.phone,
+      email: req.query.email
+    });
+
+    if (!data || (Array.isArray(data) && data.length === 0)) {
+      res.json({
+        success: true,
+        data,
+        message: 'No guests found for the provided criteria'
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      data,
+      message: 'Guest search successful'
+    });
+  } catch (error) {
+    console.error('Error searching guest:', error.message);
     if (error.response) {
       console.error('Zenoti API response status:', error.response.status);
       console.error('Zenoti API response data:', error.response.data);
