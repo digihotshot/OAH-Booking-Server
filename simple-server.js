@@ -942,7 +942,8 @@ app.get('/api/providers/zipcode/:zipcode', (req, res) => {
       name: provider.name,
       provider_id: provider.provider_id,
       status: provider.status,
-      priority: provider.priority
+      priority: provider.priority,
+      imageUrl: provider.imageUrl
     }));
     
     res.json({
@@ -1029,12 +1030,112 @@ app.post('/api/address/validate', async (req, res) => {
     
     const addressDetails = await getPlaceDetails(placeId);
     
+    // Add debug information to help troubleshoot zipcode extraction
+    const debugInfo = {
+      placeId: placeId,
+      extractedZipcode: addressDetails.zipcode,
+      hasZipcode: !!(addressDetails.zipcode && addressDetails.zipcode.trim() !== ''),
+      addressComponents: addressDetails.address_components || null,
+      postalCodeComponents: addressDetails.address_components?.filter(comp => 
+        comp.types.includes('postal_code')
+      ) || []
+    };
+    
     res.json({
       success: true,
-      data: addressDetails,
+      data: {
+        ...addressDetails,
+        debug: debugInfo
+      },
       message: 'Address validated successfully'
     });
   } catch (error) {
+    console.error('Address validation error:', error.message);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Enhanced zipcode validation endpoint
+app.post('/api/address/validate-zipcode', async (req, res) => {
+  try {
+    const { placeId, address } = req.body;
+    
+    let addressDetails = null;
+    let zipcode = null;
+    
+    // If placeId is provided, get details from Google Places API
+    if (placeId) {
+      try {
+        addressDetails = await getPlaceDetails(placeId);
+        zipcode = addressDetails.zipcode;
+      } catch (error) {
+        console.error('Google Places API error:', error.message);
+        return res.status(400).json({
+          success: false,
+          error: 'Failed to validate address with Google Places API',
+          details: error.message
+        });
+      }
+    } else if (address && address.zipcode) {
+      // If address object with zipcode is provided directly
+      zipcode = address.zipcode;
+      addressDetails = address;
+    } else {
+      return res.status(400).json({
+        success: false,
+        error: 'Either placeId or address with zipcode is required'
+      });
+    }
+    
+    // Check if zipcode was found
+    if (!zipcode || zipcode.trim() === '') {
+      return res.json({
+        success: true,
+        data: {
+          availableProviders: [],
+          isValid: false,
+          message: 'Unable to determine zipcode from address',
+          addressDetails: addressDetails,
+          debug: {
+            placeId: placeId,
+            extractedZipcode: zipcode,
+            addressComponents: addressDetails?.address_components || null
+          }
+        }
+      });
+    }
+    
+    // Get providers for this zipcode
+    const providers = getProvidersByZipcode(zipcode);
+    
+    // Convert to the format expected by frontend
+    const availableProviders = providers.map(provider => ({
+      name: provider.name,
+      provider_id: provider.provider_id,
+      status: provider.status,
+      priority: provider.priority,
+      imageUrl: provider.imageUrl
+    }));
+    
+    res.json({
+      success: true,
+      data: {
+        availableProviders: availableProviders,
+        isValid: availableProviders.length > 0,
+        message: availableProviders.length > 0 
+          ? `Found ${availableProviders.length} provider(s) serving this area`
+          : 'No providers found for this zipcode',
+        zipcode: zipcode,
+        addressDetails: addressDetails,
+        count: availableProviders.length
+      }
+    });
+    
+  } catch (error) {
+    console.error('Zipcode validation error:', error.message);
     res.status(500).json({
       success: false,
       error: error.message
@@ -1062,6 +1163,7 @@ app.post('/api/address/centers', (req, res) => {
       name: provider.name,
       priority: provider.priority,
       status: provider.status,
+      imageUrl: provider.imageUrl,
       address: {
         zipcode: address.zipcode,
         city: address.city || '',
@@ -1386,6 +1488,7 @@ app.post('/api/bookings', async (req, res) => {
           centerId,
           centerName: provider?.name || 'Unknown Provider',
           priority: provider?.priority || 999,
+          imageUrl: provider?.imageUrl || null,
           bookingId: bookingData.id,
           bookingData,
           success: true,
@@ -1401,6 +1504,7 @@ app.post('/api/bookings', async (req, res) => {
           centerId,
           centerName: provider?.name || 'Unknown Provider',
           priority: provider?.priority || 999,
+          imageUrl: provider?.imageUrl || null,
           bookingId: null,
           bookingData: null,
           success: false,
@@ -2636,6 +2740,7 @@ app.post('/api/slots/select-provider', async (req, res) => {
       data: {
         center_id,
         center_name: provider.name,
+        imageUrl: provider.imageUrl,
         booking_id: bookingId,
         guest_id,
         date: formattedDate
@@ -2706,6 +2811,7 @@ app.use((req, res) => {
       'GET /api/providers/:providerId',
       'GET /api/address/suggestions?input=address',
       'POST /api/address/validate',
+      'POST /api/address/validate-zipcode',
       'POST /api/address/centers',
       'GET /api/services/category/:categoryId',
       'GET /api/categories',
@@ -2734,6 +2840,7 @@ app.listen(PORT, () => {
   console.log(`   - GET /api/providers/:providerId`);
   console.log(`   - GET /api/address/suggestions?input=address`);
   console.log(`   - POST /api/address/validate`);
+  console.log(`   - POST /api/address/validate-zipcode`);
   console.log(`   - POST /api/address/centers`);
   console.log(`   - GET /api/categories (with services)`);
   console.log(`   - POST /api/bookings (single or multiple centers)`);

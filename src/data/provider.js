@@ -3,6 +3,7 @@ const providers = [
     name: "Lindsey Oliver, PA-C",
     provider_id: "568fdbef-f527-40f9-a428-34a57383dab4",
     zipCodes: ["48236", "48230", "48080", "48082", "48081"],
+    imageUrl:"https://images.squarespace-cdn.com/content/6410c00934ca2315502a795c/3ce61d43-5b67-4166-b133-e87778ade63d/Lindsey_reduced.jpg?content-type=image%2Fjpeg",
     status: "active",
     priority: 2,
   },
@@ -11,6 +12,7 @@ const providers = [
     provider_id:"bea93d09-9abf-4ab4-b428-8f5246720654",
     zipCodes: ["48042", "48044", "48054", "48306", "48307", "48309", "48315", "48316", "48317"],
     status: "active",
+    imageUrl:"https://images.squarespace-cdn.com/content/6410c00934ca2315502a795c/fad70ac7-0d6d-42b6-9a15-879349357894/Neha+R.+Headshot_reduced.jpg?content-type=image%2Fjpeg",
     priority: 15,
   },
   {
@@ -18,6 +20,7 @@ const providers = [
     provider_id:"40383b0f-7d47-41e8-91af-267d717f3734",
     zipCodes: ["48310", "48311", "48312", "48313", "48314", "48042", "48044", "48315", "48316", "48317", "48318", "48088", "48089", "48090", "48091", "48092", "48093", "48035", "48036", "48038", "48047", "48051", "48026", "48080", "48081", "48082", "48066", "48043", "48046", "48021", "48015", "48094", "48095", "48005", "48065", "48096", "48048", "48045", "48062", "48007", "48083", "48084", "48085", "48098", "48099", "48067", "48068", "48073", "48033", "48034", "48075", "48076", "48086", "48301", "48302", "48304", "48322", "48323", "48324", "48325", "48340", "48341", "48342", "48343", "48306", "48307", "48309", "48326", "48320", "48220", "48030", "48071", "48237", "48072", "48070", "48069", "48017", "48009", "48025", "48359", "48360", "48362"],
     status: "active",
+    imageUrl:"https://images.squarespace-cdn.com/content/6410c00934ca2315502a795c/53b54d4b-4403-4db4-bf4c-65b1a2595035/Marina+M.+Headshot_reduced.jpg?content-type=image%2Fjpeg",
     priority: 8,
   },
   {
@@ -25,6 +28,7 @@ const providers = [
     provider_id:"dba4b808-eea3-423c-a88b-23379d7a5d37",
     zipCodes: ["48009", "48301", "48302", "48304", "48098", "48067", "48073", "48072", "48017", "48025", "48071", "48334", "48322", "48034", "48093", "48167", "48168", "48069", "48220", "48070"],
     status: "inactive",
+    imageUrl:"https://images.squarespace-cdn.com/content/6410c00934ca2315502a795c/42326d7b-a9cb-4d27-b380-6254a1ec0c10/Lauren_reduce.jpg?content-type=image%2Fjpeg",
     priority: 14,
   },
   {
@@ -32,6 +36,7 @@ const providers = [
     provider_id: "5b5034d4-57c2-40d2-b04d-7be72b93c6d5",
     zipCodes: ["48326", "48072", "48025", "48009", "48301", "48302", "48303", "48304", "48382", "48331", "48332", "48333", "48334", "48335", "48336", "48025", "48320", "48150", "48152", "48154", "48167", "48374", "48375", "48376", "48323", "48324", "48306", "48307", "48309", "48067", "48073", "48320"],
     status: "active",
+    imageUrl:"https://images.squarespace-cdn.com/content/6410c00934ca2315502a795c/da845474-4d6e-4ba8-ae1c-ecad16cd10b1/Maddy+Headshot.JPG?content-type=image%2Fjpeg",
     priority: 1,
   },
   {
@@ -39,6 +44,7 @@ const providers = [
     provider_id:"6f86bfdf-0090-4708-8807-bd3f14ae5732",
     zipCodes: ["48009", "48012", "48084", "48073", "48071", "48067", "48070", "48083", "48007", "48301", "48304", "48302", "48025", "48069", "48098"],
     status: "active",
+    imageUrl:"https://images.squarespace-cdn.com/content/6410c00934ca2315502a795c/52810177-7d5f-47d6-8a78-6b7de7a8ee24/Mackenzie+C.+Headshot_reducded.jpg?content-type=image%2Fjpeg",
     priority: 10,
   },
   {
@@ -46,6 +52,7 @@ const providers = [
     provider_id:"95fa5d99-7ec1-4953-b5d7-223c466c0635",
     zipCodes: ["49001", "49002", "49004", "49006", "49007", "49008", "49009", "49010", "49012", "49015", "49017", "49024", "49034", "49037", "49041", "49046", "49048", "49052", "49053", "49055", "49060", "49071", "49074", "49077", "49078", "49079", "49080", "49081", "49083", "49087", "49088", "49097", "49344", "49348"],
     status: "active",
+    imageUrl:"https://images.squarespace-cdn.com/content/6410c00934ca2315502a795c/8f564978-34a2-4e07-9297-fee5054ea72a/Melissa_Reduced.jpg?content-type=image%2Fjpeg",
     priority: 9,
   },
   {
@@ -53,6 +60,7 @@ const providers = [
     provider_id:"02ae4411-217e-4a2f-ad72-5bdef9e3b420",
     zipCodes: ["48315", "48316", "48317", "48042", "48044", "48306", "48307", "48309", "48363", "48094", "48095", "48096", "48065", "48005", "48359", "48360", "48362", "48367", "48370", "48047", "48051", "48036", "48038", "48313", "48314", "48045"],
     status: "active",
+    imageUrl:"https://images.squarespace-cdn.com/content/6410c00934ca2315502a795c/161bc575-f64c-4822-bac1-cae85c62fb95/Bella+Headshot+2_reduced.jpg?content-type=image%2Fjpeg",
     priority: 13,
   },
   {
@@ -60,6 +68,7 @@ const providers = [
     provider_id:"8fc1b340-68ba-4b87-aaac-94672f899575",
     zipCodes: ["49201", "49202", "49203", "49272", "49254", "49230", "49263", "49234", "49261", "49246", "49283"],
     status: "active",
+    imageUrl:"https://images.squarespace-cdn.com/content/6410c00934ca2315502a795c/a5169e37-4b22-4b77-93f4-72af5025fb3b/Laura+Fick_reduced.jpg?content-type=image%2Fjpeg",
     priority: 12,
   },
   {
@@ -67,6 +76,7 @@ const providers = [
     provider_id:"2c8b8a54-24b4-450a-918f-bfe23f0fc9d1",
     zipCodes: ["48864", "48825", "48823", "48895", "48840", "48837", "48820"],
     status: "active",
+    imageUrl:"https://images.squarespace-cdn.com/content/6410c00934ca2315502a795c/2dd2063c-7b04-4145-b268-8cb998d5a388/Jenna+Mulder_reduced.jpg?content-type=image%2Fjpeg",
     priority: 16,
   },
   {
@@ -74,6 +84,7 @@ const providers = [
     provider_id:"8de68cd0-e948-46e1-865b-6dc3d9277421",
     zipCodes: ["49341", "49306", "49525", "49505", "49506"],
     status: "active",
+    imageUrl:"https://images.squarespace-cdn.com/content/6410c00934ca2315502a795c/c6138796-ff70-4ea7-b2d8-1c34c97b9b42/Danielle+Headshot.jpg?content-type=image%2Fjpeg",
     priority: 4,
   },
   {
@@ -81,6 +92,7 @@ const providers = [
     provider_id:"984e732a-8586-441e-8a4b-80248b2f7ce0",
     zipCodes: ["48430", "48436", "48439", "48442", "48451", "48473", "48507", "48114", "48116", "48169", "48178", "48353", "48836", "48843", "48855", "48433", "48420", "48867", "48817", "48476", "48429"],
     status: "active",
+    imageUrl:"https://images.squarespace-cdn.com/content/6410c00934ca2315502a795c/e972352c-62db-4d94-b3c0-ab5817c930c3/Vanessa+Headshot.JPG?content-type=image%2Fjpeg",
     priority: 7,
   },
   {
@@ -88,6 +100,7 @@ const providers = [
     provider_id:"bbbbb51e-a759-4ab0-8f7e-1007a599921a",
     zipCodes: ["48101", "48120", "48121", "48123", "48124", "48125", "48126", "48127", "48128", "48135", "48136", "48150", "48152", "48154", "48170", "48187", "48188", "48192", "48193", "48195", "48336", "48335", "48025", "48167", "48168"],
     status: "active",
+    imageUrl:"https://images.squarespace-cdn.com/content/6410c00934ca2315502a795c/20b1fb2a-0b77-4248-9e00-f007e6aee3c2/Dalia+Headshot.jpg?content-type=image%2Fjpeg",
     priority: 3,
   },
   {
@@ -95,6 +108,7 @@ const providers = [
     provider_id:"f1646348-3495-4aad-97aa-6223d68047da",
     zipCodes: ["48083", "48085", "48098", "48304", "48306", "48307", "48309", "48320", "48321", "48322", "48323", "48324", "48326", "48327", "48328", "48329", "48330", "48340", "48341", "48342", "48343", "48346", "48347", "48348", "48350", "48359", "48360", "48361", "48362", "48363", "48366", "48367", "48370", "48371", "48383", "48386"],
     status: "active",
+    imageUrl:"https://images.squarespace-cdn.com/content/6410c00934ca2315502a795c/514c319c-b59e-4e33-aea5-405f19c06455/Abby+headshot.jpg?content-type=image%2Fjpeg",
     priority: 6,
   },
   {
@@ -102,6 +116,7 @@ const providers = [
     provider_id:"258aa633-d45a-43ee-ae72-e305bfb9a78c",
     zipCodes: ["48127", "48067", "48009", "48314", "48069", "48080", "48088", "48120", "48124", "48125", "48126", "48128", "48227", "48228", "48239", "48240", "48017", "48068", "48070", "48071", "48072", "48073", "48220", "48237", "48012", "48025", "48084", "48098", "48301", "48302", "48304", "48187", "48188", "48374", "48375", "48377", "48083", "48310", "48312", "48313", "48317", "48021", "48081", "48082", "48089", "48092", "48236", "48035", "48066", "48093", "48133", "48145", "48157", "48162", "48166", "48001", "48023", "48054", "48201", "48207", "48226", "48243"],
     status: "active",
+    imageUrl:"https://images.squarespace-cdn.com/content/6410c00934ca2315502a795c/f2ebdc90-779a-4358-b391-f4439b817dcc/Jozelynn+Headshot.jpg?content-type=image%2Fjpeg",
     priority: 11,
   },
   {
@@ -109,6 +124,7 @@ const providers = [
     provider_id:"e55046db-1745-45f8-a2c1-02f00e082fcb",
     zipCodes: ["49501", "49502", "49503", "49504", "49506", "49507", "49508", "49509", "49510", "49512", "49514", "49515", "49516", "49518", "49519", "49523", "49525", "49528", "49530", "49534", "49544", "49546", "49548", "49550", "49555", "49560", "49599", "49440", "49441", "49442", "49443", "49444", "49445"],
     status: "active",
+    imageUrl:"https://images.squarespace-cdn.com/content/6410c00934ca2315502a795c/307cb33b-f994-4c8c-8fdf-be80a7fb1c4d/oli-at-home-michigan-brand-photographer-melissa-douglas-co-06104.jpg?content-type=image%2Fjpeg",
     priority: 5,
   },
   {
@@ -116,6 +132,7 @@ const providers = [
     provider_id:"81d1d447-7590-45a5-9c0e-cbb2e52c7d69",
     zipCodes: ["48103", "48104", "48105", "48108", "48109", "48113", "48187", "48188", "48170", "48167", "48168", "48374", "48375", "48377", "48189", "48176", "48111", "48185", "48186", "48150", "48152", "48154", "48135", "48184", "48174", "48125", "48127", "48178"],
     status: "active",
+    imageUrl:"https://images.squarespace-cdn.com/content/6410c00934ca2315502a795c/2a7e92ea-bb3e-4c24-b0a2-5086b6c40a7b/oli-at-home-michigan-brand-photographer-melissa-douglas-co-05587.jpg?content-type=image%2Fjpeg",
     priority: 14,
   },
 ];
